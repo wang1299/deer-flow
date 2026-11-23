@@ -16,7 +16,7 @@ from .constants import NAMESPACE
 from .service import Workflows
 
 
-@extension(api="0.2.9", name="workflows")
+@extension(api="0.2.14", name="workflows")
 def install(registry, config):
     enabled = config.get("enabled", False)
     if type(enabled) is not bool:

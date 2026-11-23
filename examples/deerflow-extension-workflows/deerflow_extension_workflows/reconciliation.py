@@ -50,6 +50,23 @@ def blocked_step(record, decision):
     return row
 
 
+def rewind_request(record, row):
+    # Rewind before this request. Replayed completed siblings still use their
+    # immutable output, while stale error responses are never fed to the JS.
+    index = next((i for i, item in enumerate(record["journal"]) if any(m.get("type") == "agent" and m.get("payload", {}).get("stepId") == row["step_id"] for m in item["frame"]["messages"])), None)
+    requests = record.setdefault("reconciliation_replay", {})
+    if index is None and not any(m.get("type") == "agent" and m.get("payload", {}).get("stepId") == row["step_id"] for m in requests.values()):
+        raise ValueError("Missing committed child request; cannot safely replay")
+    if index is None:
+        index = len(record["journal"])
+    for item in record["journal"][index:]:
+        for message in item["frame"]["messages"]:
+            if message.get("type") != "log":
+                requests[str(message["id"])] = copy.deepcopy(message)
+    record["journal"] = record["journal"][:index]
+    record["journal_bytes"] = len(json.dumps(record["journal"]).encode())
+
+
 def apply_decision(record, decision, observed, *, actor, now, max_calls):
     """Pure transformation, called only inside the store's serialized transaction."""
     from .service import identity
@@ -60,28 +77,20 @@ def apply_decision(record, decision, observed, *, actor, now, max_calls):
         raise ValueError("Reconciliation audit limit (128)")
     outcome = decision["outcome"]
     cancelled = record.get("cancel_requested") is True
-    if cancelled and outcome in ("no_effect", "compensated"):
-        raise ValueError("Cancellation cannot authorize another attempt; reconcile completed results or keep unknown")
     before = row["status"]
     if outcome != "unknown":
         if not observed:
             raise ValueError("An observed child outcome is required")
-        # Rewind before this request. Replayed completed siblings still use their
-        # immutable output, while stale error responses are never fed to the JS.
-        index = next((i for i, item in enumerate(record["journal"]) if any(m.get("type") == "agent" and m.get("payload", {}).get("stepId") == row["step_id"] for m in item["frame"]["messages"])), None)
-        requests = record.setdefault("reconciliation_replay", {})
-        if index is None and not any(m.get("type") == "agent" and m.get("payload", {}).get("stepId") == row["step_id"] for m in requests.values()):
-            raise ValueError("Missing committed child request; cannot safely replay")
-        if index is None:
-            index = len(record["journal"])
-        for item in record["journal"][index:]:
-            for message in item["frame"]["messages"]:
-                if message.get("type") != "log":
-                    requests[str(message["id"])] = copy.deepcopy(message)
+        if not cancelled:
+            rewind_request(record, row)
         if outcome == "completed":
             if observed.get("status") != "completed" or "output" not in observed:
                 raise ValueError("Completed reconciliation requires an attributable result")
             row.update(copy.deepcopy(observed))
+            row.pop("error", None)
+        elif cancelled:
+            row.update(copy.deepcopy(observed))
+            row.update(status="cancelled")
             row.pop("error", None)
         else:
             if sum(s["attempt"] for s in record["steps"]) >= max_calls:
@@ -96,11 +105,10 @@ def apply_decision(record, decision, observed, *, actor, now, max_calls):
             retry.update(attempt=attempt, thread_id="workflow-" + identity([record["id"], row["step_id"], attempt])[:32], run_id=None, status="queued", admission_started=False, idempotency_key=f"{record['id']}:{message_id}:{attempt}")
             row.clear()
             row.update(retry)
-        record["journal"] = record["journal"][:index]
-        record["journal_bytes"] = len(json.dumps(record["journal"]).encode())
     # Operator time does not create a new execution budget. Preserve the last
     # durable allowance; it can only shrink during subsequent execution.
     record.pop("budget_deadline", None)
+    record["reconciliation_pending_recovery"] = True
     record.update(status="needs_reconciliation", error="Uncertain child outcomes remain blocked")
     safe = ("completed", "queued", "cancelled") if cancelled else ("completed", "queued")
     if outcome != "unknown" and all(s["status"] in safe or (not cancelled and s["status"] == "running" and s.get("run_id")) for s in record["steps"]):
@@ -157,16 +165,13 @@ class Reconciliation:
                     raise ValueError("Child run identity does not match the blocked attempt")
                 if child:
                     async with asyncio.timeout(5):
+                        await runs.validate_run_identity(thread_id=row["thread_id"], run_id=child, idempotency_key=row["idempotency_key"])
                         run = await runs.get(thread_id=row["thread_id"], run_id=child)
                     if run.thread_id != row["thread_id"] or run.run_id != child or run.status not in ("success", "error", "interrupted", "timeout"):
                         raise ValueError("Child must be observed terminal before resolving its reservation")
                     observed.update(run_id=child, child_status=run.status, stop_reason=run.stop_reason)
                     if decision["outcome"] == "completed":
-                        await self.collect_result(runs, record, observed, run)
-                    else:
-                        async with asyncio.timeout(5):
-                            state = await runs.get_state(thread_id=row["thread_id"])
-                        self.result_marker(observed, state, child)
+                        await self.collect_result(runs, record, observed, run, strict=True)
                 elif decision["outcome"] == "completed" or not (row.get("admission_rejected") is True or row.get("admission_started") is False or row["status"] == "creating_thread"):
                     # Even an operator assertion cannot release an unidentified,
                     # possibly running child. Admission rejection is durable proof.
@@ -178,7 +183,7 @@ class Reconciliation:
                 return await asyncio.to_thread(self.store.reconcile, owner, decision, observed, self.config["max_calls"])
 
     @staticmethod
-    def result_marker(row, state, run_id):
+    def result_marker(row, state, run_id, *, strict=False):
         from .service import pending_input
 
         messages = state.get("values", {}).get("messages", [])
@@ -192,22 +197,25 @@ class Reconciliation:
                 for i, m in enumerate(messages)
                 if m.get("type", m.get("role")) in ("human", "user")
                 and not m.get("additional_kwargs", {}).get("hide_from_ui")
-                and (m.get("id") in (message_id, f"{message_id}__user") or m.get("additional_kwargs", {}).get("run_id") == run_id)
+                and (m.get("id") in (message_id, f"{message_id}__user") or (not strict and m.get("additional_kwargs", {}).get("run_id") == run_id))
             ),
             None,
         )
         if marker is None or any(m.get("type", m.get("role")) in ("human", "user") for m in messages[marker + 1 :]):
             row["status"] = "result_conflict"
             raise ValueError("Thread advanced before result collection")
+        stamped = messages[marker].get("additional_kwargs", {}).get("run_id")
+        if strict and stamped is not None and stamped != run_id:
+            raise ValueError("Input message belongs to a different child run")
         return messages[marker + 1 :]
 
-    async def collect_result(self, runs, record, row, run):
+    async def collect_result(self, runs, record, row, run, *, strict=False):
         """Shared live/reconciliation attribution and bounded snapshot validation."""
         from .service import AGENT_OUTPUT_BYTES, encoded, identity
 
         async with asyncio.timeout(5):
             state = await runs.get_state(thread_id=row["thread_id"])
-        messages = self.result_marker(row, state, run.run_id)
+        messages = self.result_marker(row, state, run.run_id, strict=strict)
         if run.status != "success":
             row["status"] = "failed"
             raise ValueError("Agent run did not succeed")

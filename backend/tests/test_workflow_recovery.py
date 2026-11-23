@@ -169,7 +169,7 @@ async def test_real_process_kill_during_review(plugin):
     program = r"""
 import asyncio,json,sys
 from deerflow_extension_workflows.service import Workflows
-from test_workflow_plugin import Runs,context
+from support.workflow_runs import Runs,context
 async def main():
     service=Workflows(json.loads(sys.argv[1]));await service.start(None)
     runs=Runs()
@@ -225,7 +225,7 @@ async def test_external_write_then_process_death_requires_durable_reconciliation
 import asyncio,json,os,sys
 from pathlib import Path
 from deerflow_extension_workflows.service import Workflows
-from test_workflow_plugin import Runs,context
+from support.workflow_runs import Runs,context
 
 class ChildService(Runs):
     async def start(self, **kwargs):
@@ -236,7 +236,7 @@ class ChildService(Runs):
             with Path(sys.argv[2]).open('a') as target:
                 target.write('external-write\n');target.flush();os.fsync(target.fileno())
             Path(sys.argv[3]).write_text(json.dumps({'threads':self.threads,'run':{
-                'thread_id':child.thread_id,'run_id':child.run_id,'status':child.status}}))
+                'thread_id':child.thread_id,'run_id':child.run_id,'status':child.status},'key':kwargs['idempotency_key']}))
         await asyncio.to_thread(commit)
         print(json.dumps({'run_id':kwargs['idempotency_key'].split(':')[0],'child_run_id':child.run_id}),flush=True)
         # Lose the Gateway before returning the child admission/result receipt.
@@ -262,6 +262,7 @@ asyncio.run(main())
         runs.threads = snapshot["threads"]
         observed = AgentRun(**snapshot["run"])
         runs.runs[observed.run_id] = observed
+        runs.identities[(observed.thread_id, observed.run_id)] = snapshot["key"]
         session = replace(context(runs), interaction="session")
         run_id = identities["run_id"]
         assert (await actions["recover"]({"run_id": run_id}, session))["status"] == "needs_reconciliation"

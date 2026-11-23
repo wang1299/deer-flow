@@ -13,6 +13,7 @@ import pytest
 import pytest_asyncio
 from deerflow_extension_api import AgentRun, AgentRunError, ExtensionPrincipal
 from deerflow_extension_api.plugins import ActionContext
+from support.workflow_runs import Runs, context
 from test_extension_agent_runs import host as _host_fixture
 from test_extension_agent_runs import runtime as _runtime_fixture
 
@@ -24,131 +25,6 @@ pytestmark = [
 ]
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-class Runs:
-    def __init__(self):
-        self.threads = {}
-        self.runs = {}
-        self.starts = []
-        self.active = 0
-        self.peak = 0
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-        self.admission = asyncio.Event()
-        self.return_admission = asyncio.Event()
-        self.hold_admission = False
-        self.jobs = []
-        self.denied = False
-
-    revision = "initial"
-
-    def capture_authority(self):
-        if self.denied:
-            return None
-        return {"token_version": 0, "source": "session", "permissions": ["runs:create", "threads:write"]}
-
-    async def configuration_evidence(self, *, thread_id, run_id):
-        return {"run_id": run_id, "thread_id": thread_id, "source": "host_assembly", "version": "synthetic-assembly", "model": "test-model"}
-
-    async def read_artifact(self, *, thread_id, path):
-        return self.file_content
-
-    file_content = b"original file"
-
-    async def configuration_revision(self, *, assistant_ids, durable=False):
-        if self.denied:
-            raise AgentRunError(403, "revoked")
-        return self.revision
-
-    async def create_thread(self, *, assistant_id, thread_id, metadata):
-        if self.denied:
-            raise AgentRunError(403, "revoked")
-        self.threads.setdefault(
-            thread_id,
-            {
-                "values": {"messages": []},
-                "next": [],
-                "interrupts": [],
-                "assistant": assistant_id,
-            },
-        )
-        return thread_id
-
-    async def start(self, *, thread_id, input, idempotency_key):
-        if self.denied:
-            raise AgentRunError(403, "revoked")
-        if idempotency_key in self.runs:
-            return self.runs[idempotency_key]
-        run = AgentRun(thread_id, idempotency_key, "running", self.threads[thread_id]["assistant"])
-        self.runs[run.run_id] = run
-        self.starts.append((thread_id, input, idempotency_key))
-        self.threads[thread_id]["values"]["messages"].extend(input["messages"])
-        self.jobs.append(asyncio.create_task(self.answer(run, input)))
-        self.admission.set()
-        if self.hold_admission:
-            await self.return_admission.wait()
-        return run
-
-    async def answer(self, run, input):
-        task = json.loads(input["messages"][0]["content"])
-        self.active += 1
-        self.peak = max(self.peak, self.active)
-        self.entered.set()
-        try:
-            if task == "blocked":
-                await self.release.wait()
-            else:
-                await asyncio.sleep(0.02)
-            if self.runs[run.run_id].status != "running":
-                return
-            state = self.threads[run.thread_id]
-            if task == "interrupt":
-                state["next"] = ["tools"]
-                state["interrupts"] = [{"value": "Approve?"}]
-            elif task == "clarification":
-                state["values"]["messages"].append(
-                    {
-                        "type": "tool",
-                        "artifact": {
-                            "human_input": {
-                                "kind": "human_input_request",
-                                "version": 2,
-                                "request_id": "req",
-                                "source": "ask_clarification",
-                                "question": "Confirm?",
-                            }
-                        },
-                    }
-                )
-            else:
-                state["values"]["messages"].append({"type": "ai", "content": json.dumps({"echo": task})})
-            self.runs[run.run_id] = AgentRun(run.thread_id, run.run_id, "error" if task == "fail" else "success")
-        finally:
-            self.active -= 1
-
-    async def get(self, *, thread_id, run_id):
-        if self.denied:
-            raise AgentRunError(403, "revoked")
-        return self.runs[run_id]
-
-    async def wait(self, *, thread_id, run_id, timeout=60):
-        async with asyncio.timeout(timeout):
-            while (await self.get(thread_id=thread_id, run_id=run_id)).status == "running":
-                await asyncio.sleep(0.002)
-        return await self.get(thread_id=thread_id, run_id=run_id)
-
-    async def get_state(self, *, thread_id):
-        return self.threads[thread_id]
-
-    async def cancel(self, *, thread_id, run_id):
-        self.runs[run_id] = AgentRun(thread_id, run_id, "interrupted")
-        self.release.set()
-
-    async def close(self):
-        self.release.set()
-        self.return_admission.set()
-        await asyncio.gather(*self.jobs, return_exceptions=True)
 
 
 @pytest_asyncio.fixture
@@ -181,10 +57,6 @@ async def plugin(tmp_path, monkeypatch):
     await runs.close()
 
 
-def context(runs, owner="alice"):
-    return ActionContext(ExtensionPrincipal(owner), {"enabled": True}, agent_runs=runs)
-
-
 async def launch(plugin, script, **extra):
     _, actions, _, runs = plugin
     return await actions["launch"]({"request_id": "test", "script": script, "args": {}, **extra}, context(runs))
@@ -196,7 +68,7 @@ async def done(plugin, run_id):
     return await actions["get"]({"run_id": run_id}, context(runs))
 
 
-async def lost_child_receipt(plugin, monkeypatch, *, task="write-once"):
+async def lost_child_receipt(plugin, monkeypatch, *, task="write-once", unattended=False):
     """The child completes an effect, but the real supervisor loses its receipt."""
     runs = plugin[3]
     start = runs.start
@@ -207,7 +79,10 @@ async def lost_child_receipt(plugin, monkeypatch, *, task="write-once"):
         raise AgentRunError(503, "Connection lost after admission")
 
     monkeypatch.setattr(runs, "start", lose_receipt)
-    launched = await launch(plugin, "const a=await agent({stepId:'write',agentRef:'lead_agent',task:args.task}); return a.output;", args={"task": task})
+    launched = await plugin[1]["launch"](
+        {"request_id": "test", "script": "const a=await agent({stepId:'write',agentRef:'lead_agent',task:args.task}); return a.output;", "args": {"task": task}, "unattended_recovery": unattended},
+        replace(context(runs), interaction="session"),
+    )
     final = await done(plugin, launched["run_id"])
     assert final["status"] == "needs_reconciliation", final
     monkeypatch.setattr(runs, "start", start)
@@ -292,7 +167,7 @@ async def test_reconcile_unknown_blocks_and_safe_retry_uses_new_attempt(plugin, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", ["active", "advanced", "missing", "interrupt", "proof"])
+@pytest.mark.parametrize("invalid", ["active", "advanced", "missing", "interrupt", "proof", "run_marker_only", "conflicting_stamp", "different_key"])
 async def test_reconcile_never_commits_unverified_result(plugin, monkeypatch, invalid):
     _, actions, service, runs = plugin
     payload = await lost_child_receipt(plugin, monkeypatch)
@@ -306,13 +181,20 @@ async def test_reconcile_never_commits_unverified_result(plugin, monkeypatch, in
         runs.threads[row["thread_id"]]["values"]["messages"] = []
     elif invalid == "interrupt":
         runs.threads[row["thread_id"]]["interrupts"] = [{"value": "pending input"}]
+    elif invalid == "run_marker_only":
+        message = runs.threads[row["thread_id"]]["values"]["messages"][0]
+        message.update(id="unrelated-input", additional_kwargs={"run_id": payload["child_run_id"]})
+    elif invalid == "conflicting_stamp":
+        runs.threads[row["thread_id"]]["values"]["messages"][0]["additional_kwargs"] = {"run_id": "other-admission"}
+    elif invalid == "different_key":
+        runs.identities[(row["thread_id"], payload["child_run_id"])] = "different-admission"
     else:
 
         async def wrong_proof(**kwargs):
             return {"source": "host_assembly", "thread_id": row["thread_id"], "run_id": "wrong-run", "version": "wrong"}
 
         monkeypatch.setattr(runs, "configuration_evidence", wrong_proof)
-    with pytest.raises(ValueError):
+    with pytest.raises((ValueError, AgentRunError)):
         await actions["reconcile"](payload, replace(context(runs), interaction="session"))
     assert original == await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
     assert len(runs.starts) == 1
@@ -341,6 +223,44 @@ async def test_reconcile_pre_admission_failure_allows_one_explicit_retry(plugin,
     await actions["recover"]({"run_id": run_id}, session)
     assert (await done(plugin, run_id))["status"] == "completed"
     assert len(runs.starts) == 1 and runs.starts[0][0] != attempted[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["no_effect", "compensated"])
+async def test_reconcile_safe_retry_of_terminal_interrupted_graph(plugin, monkeypatch, outcome):
+    _, actions, service, runs = plugin
+    payload = await lost_child_receipt(plugin, monkeypatch)
+    row = (await asyncio.to_thread(service.store.get, "alice", payload["run_id"]))["steps"][0]
+    runs.runs[payload["child_run_id"]] = AgentRun(row["thread_id"], payload["child_run_id"], "interrupted")
+    runs.threads[row["thread_id"]]["next"] = ["suspended"]
+    runs.threads[row["thread_id"]]["interrupts"] = [{"value": "old suspended graph"}]
+    session = replace(context(runs), interaction="session")
+    assert (await actions["reconcile"]({**payload, "outcome": outcome}, session))["status"] == "recoverable"
+    await actions["recover"]({"run_id": payload["run_id"]}, session)
+    assert (await done(plugin, payload["run_id"]))["status"] == "completed"
+    assert len(runs.starts) == 2 and runs.starts[0][0] != runs.starts[1][0]
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_requires_manual_recovery_despite_prior_unattended_grant(plugin, monkeypatch):
+    from types import SimpleNamespace
+
+    _, actions, service, runs = plugin
+    payload = await lost_child_receipt(plugin, monkeypatch, unattended=True)
+    session = replace(context(runs), interaction="session")
+    await actions["reconcile"]({**payload, "outcome": "compensated"}, session)
+    restorer = Restorer(runs)
+    await service.stop()
+    await service.start(SimpleNamespace(agent_runs_restore=restorer))
+    await asyncio.wait_for(service.recovery_scan, 5)
+    assert not restorer.calls and len(runs.starts) == 1
+    record = await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    assert record["reconciliation_pending_recovery"] is True
+    assert record["grant"]["revoked"] is False
+    assert record["status"] == "recoverable"
+    await actions["recover"]({"run_id": payload["run_id"]}, session)
+    assert (await done(plugin, payload["run_id"]))["status"] == "completed"
+    assert len(runs.starts) == 2
 
 
 @pytest.mark.asyncio
@@ -442,6 +362,7 @@ async def test_reconcile_real_gateway_capability_rechecks_revocation_before_comm
     """Real host admission/graph/assembly evidence and live account guards."""
     _, actions, service, _ = plugin
     bound, state, request, _, _ = gateway_runtime
+    bound = bound.for_plugin("community.workflows")
     _, _, load_user = host
     owner = str(request.state.user.id)
     # Host assembly imports on mounted development volumes are outside the

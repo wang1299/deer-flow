@@ -175,17 +175,23 @@ async def test_reconciliation_cannot_override_live_lease_or_unknown_capacity(clu
         await b.delete({"run_id": payload["run_id"]}, session)
 
 
-async def test_reconciliation_releases_cancelled_child_without_resurrecting_workflow(cluster, monkeypatch):
+@pytest.mark.parametrize("outcome", ["completed", "no_effect", "compensated"])
+async def test_reconciliation_releases_cancelled_child_without_resurrecting_workflow(cluster, monkeypatch, outcome):
     a, b, runs = cluster
     payload = await lost_cluster_receipt(cluster, monkeypatch, cancel=True)
     session = replace(context(runs), interaction="session")
-    with pytest.raises(ValueError, match="Cancellation cannot authorize"):
-        await b.reconcile({**payload, "outcome": "compensated"}, session)
-    assert (await b.reconcile(payload, session))["status"] == "cancelled"
+    if outcome != "completed":
+        from deerflow_extension_api import AgentRun
+
+        row = (await asyncio.to_thread(a.store.get, "alice", payload["run_id"]))["steps"][0]
+        runs.runs[payload["child_run_id"]] = AgentRun(row["thread_id"], payload["child_run_id"], "interrupted")
+        runs.threads[row["thread_id"]]["interrupts"] = [{"value": "suspended old graph"}]
+    assert (await b.reconcile({**payload, "outcome": outcome}, session))["status"] == "cancelled"
     assert await asyncio.to_thread(retained_slots, a, payload["run_id"]) == 0
     with pytest.raises(ValueError, match="not recoverable"):
         await a.recover({"run_id": payload["run_id"]}, session)
     assert len(runs.starts) == 1
+    assert (await asyncio.to_thread(b.store.get, "alice", payload["run_id"]))["steps"][0]["attempt"] == 1
 
 
 async def test_expired_owner_cannot_write_after_takeover(cluster):
@@ -289,7 +295,7 @@ async def test_real_owner_kill_during_review_and_rolling_upgrade(cluster):
     program = r"""
 import asyncio,json,sys
 from deerflow_extension_workflows.service import Workflows
-from test_workflow_plugin import Runs,context
+from support.workflow_runs import Runs,context
 async def main():
     service=Workflows(json.loads(sys.argv[1]));await service.start(None)
     runs=Runs()

@@ -56,7 +56,7 @@ function mount(root, context) {
     const box=node('fieldset','',{className:'reconciliation'});
     box.append(node('legend',t(`Reconcile ${step.step_id} / attempt ${step.attempt}`,`核对 ${step.step_id} / 第 ${step.attempt} 次尝试`)),node('p',t('Inspect the exact child and external effects first. This records your decision; it does not approve output or resume execution.','请先核实此子任务和外部影响。此操作只记录处理决定，不确认成果，也不恢复执行。')));
     const outcome=node('select','',{ariaLabel:t('Observed outcome','核实结果')});
-    for(const [value,en,zh] of [['unknown','Unknown — keep blocked','无法确认，保持阻塞'],['completed','Completed — reuse verified child result','已完成，复用核实后的子任务结果'],['no_effect','No external effect — authorize a new attempt','无外部影响，允许新尝试'],['compensated','External effects compensated — authorize a new attempt','外部影响已补偿，允许新尝试']])outcome.append(node('option',t(en,zh),{value}));
+    for(const [value,en,zh] of [['unknown','Unknown — keep blocked','无法确认，保持阻塞'],['completed','Completed — reuse verified child result','已完成，复用核实后的子任务结果'],['no_effect','No external effect — authorize a new attempt','无外部影响，允许新尝试'],['compensated','External effects compensated — authorize a new attempt','外部影响已补偿，允许新尝试']])outcome.append(node('option',run.cancel_requested&&['no_effect','compensated'].includes(value)?t(en.split(' — ')[0]+' — resolve cancellation without retry',zh.split('，')[0]+'，核销取消结果，不重试'):t(en,zh),{value}));
     const child=node('input','',{ariaLabel:t('Child run ID','子任务运行 ID'),value:step.run_id||'',placeholder:t('Required if the admission receipt was lost','接收结果丢失时需要填写')});
     if(step.run_id)child.readOnly=true;
     const evidence=node('input','',{ariaLabel:t('Evidence reference','核实依据引用'),placeholder:'incident://…',maxLength:512});

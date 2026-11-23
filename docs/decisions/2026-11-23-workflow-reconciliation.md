@@ -44,15 +44,28 @@ remaining execution allowance is preserved, not reset.
 ## Compatibility and limits
 
 Existing workflow JSON records gain bounded reconciliation receipts and prior
-attempts. No host schema or extension-API contract changes are required. Runtime
+attempts. No host schema changes are required. Add a read-only
+`AgentRuns.validate_run_identity(thread_id, run_id, idempotency_key)` capability:
+the host validates the current owner/read authority, plugin namespace, persisted
+scoped admission key and server-owned extension origin, without dispatching,
+canceling or requiring artifact capture. Existing assembly evidence and mutable
+thread markers cannot prove that a caller-supplied terminal run is the lost keyed
+admission. The additive API is versioned with a matching workflow dependency;
+older hosts fail closed. Completion still requires the matching visible input
+and valid result; safe retry requires terminal admission identity and explicit
+external-effect attestation, not a successful output or empty interrupt state.
+After any reconciliation, unattended grants cannot dispatch work until a fresh
+session explicitly calls Recover. That action consumes the manual-recovery guard;
+it does not silently renew or widen the original standing grant. Runtime
 compatibility hashing includes the reconciliation implementation, so an old
 worker cannot resume a record written under changed lifecycle semantics.
 Deleting unresolved workflow records cannot discard outstanding uncertainty.
 Human output-approval checkpoints remain a separate decision and are never
 implicitly approved by reconciliation.
 Cancellation remains binding. Reconciliation after cancellation cleanup may
-record a completed child and release its reservation, but cannot create a retry
-or resume dependent work. A pending cancellation must finish its cleanup first.
+record a completed child or verified no-effect/compensated outcome and release
+its reservation, but cannot create a retry or resume dependent work. A pending
+cancellation must finish its cleanup first.
 
 A child whose admission receipt was lost must be identified and observed before
 completion or retry. Without an observable child or durable pre-dispatch proof,

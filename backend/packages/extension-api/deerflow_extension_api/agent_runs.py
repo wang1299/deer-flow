@@ -120,6 +120,16 @@ class AgentRuns(Protocol):
         """
         ...
 
+    async def validate_run_identity(self, *, thread_id: str, run_id: str, idempotency_key: str) -> None:
+        """Prove this plugin's persisted keyed admission, without dispatching.
+
+        Rechecks current run-read authority and owner/thread, the scoped durable
+        idempotency key and trusted extension origin. Works for terminal runs as
+        well as active ones; it proves admission identity, not a valid result or
+        absence of external effects. A missing record/key fails closed.
+        """
+        ...
+
     async def read_artifact(self, *, thread_id: str, path: str, expected_checkpoint_id: str | None = None) -> bytes:
         """Read a bounded regular output file through owner authorization.
 

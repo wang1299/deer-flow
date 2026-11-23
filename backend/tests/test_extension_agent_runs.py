@@ -358,6 +358,33 @@ async def test_plugin_scoping_preserves_key_validation_and_authorization(host):
 
 
 @pytest.mark.asyncio
+async def test_validate_run_identity_uses_durable_plugin_admission_without_dispatch(runtime, host):
+    from deerflow_extension_api.agent_runs import AgentRunError
+
+    bound, state, request, _, _ = runtime
+    scoped = bound.for_plugin("identity-fixture")
+    thread = await scoped.create_thread(thread_id="identity-proof")
+    child = await scoped.start(thread_id=thread, input={"messages": [{"role": "user", "id": "expected-input", "content": "first"}]}, idempotency_key="attempt-1")
+    assert (await scoped.wait(thread_id=thread, run_id=child.run_id, timeout=30)).status == "success"
+    await scoped.validate_run_identity(thread_id=thread, run_id=child.run_id, idempotency_key="attempt-1")
+    for observer, identity in ((scoped, "another-key"), (bound.for_plugin("other-plugin"), "attempt-1"), (bound, "attempt-1")):
+        with pytest.raises(AgentRunError):
+            await observer.validate_run_identity(thread_id=thread, run_id=child.run_id, idempotency_key=identity)
+    with pytest.raises(AgentRunError):
+        await scoped.validate_run_identity(thread_id="other-thread", run_id=child.run_id, idempotency_key="attempt-1")
+    # An ordinary later run with identical caller-controlled input IDs still
+    # cannot impersonate the persisted plugin-keyed admission.
+    other = await scoped.start(thread_id=thread, input={"messages": [{"role": "user", "id": "expected-input", "content": "later"}]}, idempotency_key="another-key")
+    await scoped.wait(thread_id=thread, run_id=other.run_id, timeout=30)
+    with pytest.raises(AgentRunError):
+        await scoped.validate_run_identity(thread_id=thread, run_id=other.run_id, idempotency_key="attempt-1")
+    _, _, load_user = host
+    load_user.return_value = request.state.user.model_copy(update={"disabled": True})
+    with pytest.raises(AgentRunError, match="revoked"):
+        await scoped.validate_run_identity(thread_id=thread, run_id=child.run_id, idempotency_key="attempt-1")
+
+
+@pytest.mark.asyncio
 async def test_wait_uses_capped_backoff_and_returns_terminal_status(host, monkeypatch):
     from deerflow_extension_api.agent_runs import AgentRun
 

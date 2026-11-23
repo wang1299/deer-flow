@@ -72,6 +72,7 @@ class Recovery:
                 await asyncio.to_thread(self.store.artifact, owner, run_id, artifact["version"])
             entry["replay"] = copy.deepcopy(record["journal"])
             entry["reconciliation_replay"] = copy.deepcopy(record.get("reconciliation_replay", {}))
+            record.pop("reconciliation_pending_recovery", None)
             record.update(status="queued", error=None)
             await self.save(owner, record)
             self.publish(entry)
@@ -80,7 +81,13 @@ class Recovery:
     def grant_usable(self, record):
         grant = record.get("grant")
         return (
-            isinstance(grant, dict) and grant.get("version") == 1 and grant.get("revoked") is not True and isinstance(grant.get("expires_at"), (int, float)) and grant["expires_at"] > time.time() and isinstance(grant.get("authority"), dict)
+            not record.get("reconciliation_pending_recovery")
+            and isinstance(grant, dict)
+            and grant.get("version") == 1
+            and grant.get("revoked") is not True
+            and isinstance(grant.get("expires_at"), (int, float))
+            and grant["expires_at"] > time.time()
+            and isinstance(grant.get("authority"), dict)
         )
 
     def grant_validator(self, owner, run_id):

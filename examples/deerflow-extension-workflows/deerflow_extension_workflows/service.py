@@ -72,6 +72,7 @@ def project(record, detail=True):
         definition=record.get("definition"),
         configuration_revision=record.get("configuration_revision"),
         revision=record.get("revision", 0),
+        cancel_requested=record.get("cancel_requested", False),
     )
     if detail:
         result.update(

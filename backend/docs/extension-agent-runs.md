@@ -124,6 +124,16 @@ still evaluates the current user. Do not expose a retained handle to other users
 
 ### Immutable file review and run configuration evidence
 
+As of API 0.2.14, `AgentRuns.validate_run_identity(thread_id, run_id,
+idempotency_key)` is a read-only check that a supplied run is this plugin's
+persisted admission. It requires a plugin-scoped handle, rechecks current
+run-read and owner/thread authority, and compares the host-scoped durable key
+and server-owned extension origin. It works for terminal or active runs and
+never starts/cancels work or requires artifact-capture support. A successful
+check proves identity only: callers must still observe terminal state, validate
+result attribution, or explicitly reconcile external effects. It must not be
+replaced by calling `start` as a lookup, since a missing key could dispatch work.
+
 `AgentRuns.configuration_evidence(thread_id, run_id)` returns host-owned proof
 recorded from actual Agent assembly before graph execution and bound to the run.
 It includes actual model, safe numeric parameters and keyed versions of instructions,

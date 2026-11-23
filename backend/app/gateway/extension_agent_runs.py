@@ -217,6 +217,19 @@ class _BoundAgentRuns:
                 raise AgentRunError(409, "Host assembly evidence unavailable")
             return copy.deepcopy(evidence)
 
+    async def validate_run_identity(self, *, thread_id, run_id, idempotency_key):
+        from app.gateway.deps import get_run_manager
+        from app.gateway.routers.thread_runs import _scope_http_run_idempotency_key
+
+        if self._plugin_namespace is None or not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 200:
+            raise AgentRunError(422, "Run identity requires a plugin-scoped admission key")
+        async with self._request("runs:read", thread_id) as request:
+            run = await get_run_manager(request).get(run_id, user_id=self._user_id)
+            key = _scope_http_run_idempotency_key(request, thread_id, f"extension:{self._plugin_namespace}:{idempotency_key}")
+            origin = (run.metadata or {}).get(DEERFLOW_ORIGIN_KEY) if run is not None else None
+            if run is None or run.thread_id != thread_id or run.idempotency_key != key or origin != make_origin("extension", namespace=self._plugin_namespace):
+                raise AgentRunError(404, "Keyed run identity unavailable")
+
     async def validate_artifact_source(self, *, thread_id, run_id, idempotency_key):
         from app.gateway.deps import get_run_manager
         from app.gateway.extension_artifacts import validate_capture_support

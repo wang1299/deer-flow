@@ -33,8 +33,9 @@ attempt:
 | **External effects compensated** | Explicitly attest that the external effects were safely compensated and authorize one new attempt under the same observation requirement. |
 
 If the admission receipt was lost, supply the child run ID from the displayed
-stable thread. The host checks that identity against the owner's thread and the
-persisted input; an arbitrary run or operator assertion cannot substitute for an
+stable thread. The host proves its persisted, plugin-scoped admission key and
+trusted extension origin, then checks the owner's thread and persisted input for
+result collection. An arbitrary run or operator assertion cannot substitute for an
 observable terminal child. An unidentified, possibly active admission remains
 blocked. A terminal run alone is **not** proof that it had no external effect.
 
@@ -46,15 +47,16 @@ audit is visible on the run; the bounded complete audit remains in workflow
 storage. Unresolved runs cannot be deleted to discard their uncertainty.
 
 Reconciliation never dispatches a child. After all blocked attempts are resolved,
-choose **Recover workflow** explicitly. Recovery rechecks current permissions,
+choose **Recover workflow** explicitly, even if the original run had an unattended
+recovery grant. A restart cannot consume that grant to bypass reconciliation review. Recovery rechecks current permissions,
 configuration and runtime compatibility. Completed siblings reuse their retained
 output; a safe retry gets a new attempt, thread, input-message and idempotency
 identity and counts against `max_calls`. Changed replay inputs fail closed.
 The last durable execution allowance is preserved rather than reset. Existing
 human output checkpoints still require their own exact-version approval.
-Cancellation remains binding: after cancellation cleanup, a completed-child
-reconciliation can release retained capacity, but cannot resurrect the workflow
-or authorize a retry. Finish pending cancellation cleanup before reconciling.
+Cancellation remains binding: after cancellation cleanup, a completed/no-effect/compensated
+reconciliation can release retained capacity and close the existing attempt,
+but cannot resurrect the workflow or create another attempt. Finish pending cancellation cleanup before reconciling.
 
 The session-only backend action is `reconcile` (not a model tool):
 
@@ -78,7 +80,7 @@ does not migrate incompatible workflows or manufacture missing historical output
 
 ## Install and enable
 
-Requires a POSIX Gateway (Linux/macOS), Python 3.12+, the public extension API 0.2.9,
+Requires a POSIX Gateway (Linux/macOS), Python 3.12+, the public extension API 0.2.14,
 and a **single Gateway process per SQLite storage file**, or the shared PostgreSQL
 mode described below. Windows execution is unsupported. SQLite holds an exclusive process lock; another process using that same file
 fails service startup rather than recovering another worker's live workflows.
