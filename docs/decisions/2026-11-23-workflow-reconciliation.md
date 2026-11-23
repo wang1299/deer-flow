@@ -55,7 +55,9 @@ older hosts fail closed. Completion still requires the matching visible input
 and valid result; safe retry requires terminal admission identity and explicit
 external-effect attestation, not a successful output or empty interrupt state.
 After any reconciliation, unattended grants cannot dispatch work until a fresh
-session explicitly calls Recover. That action consumes the manual-recovery guard;
+session explicitly calls Recover. The guard is checked on the fresh record under
+the recovery admission lock, including after an awaited capability restore;
+a stale unattended scan cannot consume it. Manual Recover consumes the guard;
 it does not silently renew or widen the original standing grant. Runtime
 compatibility hashing includes the reconciliation implementation, so an old
 worker cannot resume a record written under changed lifecycle semantics.

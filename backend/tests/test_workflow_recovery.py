@@ -208,11 +208,13 @@ asyncio.run(main())
             await child.wait()
 
 
-async def test_external_write_then_process_death_requires_durable_reconciliation(plugin, tmp_path):
+@pytest.mark.parametrize("stale_grant_scan", [False, True])
+async def test_external_write_then_process_death_requires_durable_reconciliation(plugin, tmp_path, stale_grant_scan):
     """Real SIGKILL + SQLite/JS worker; the outer child service is controlled."""
     import json
     import sys
     from pathlib import Path
+    from types import SimpleNamespace
 
     from deerflow_extension_api import AgentRun
 
@@ -223,6 +225,7 @@ async def test_external_write_then_process_death_requires_durable_reconciliation
     host_state = tmp_path / "child-service.json"
     program = r"""
 import asyncio,json,os,sys
+from dataclasses import replace
 from pathlib import Path
 from deerflow_extension_workflows.service import Workflows
 from support.workflow_runs import Runs,context
@@ -244,12 +247,23 @@ class ChildService(Runs):
 
 async def main():
     service=Workflows(json.loads(sys.argv[1]));await service.start(None)
-    await service.launch({'request_id':'external-crash','script':"return (await agent({stepId:'write',agentRef:'lead_agent',task:'synthetic-write'})).output;",'args':{}},context(ChildService()))
+    await service.launch({'request_id':'external-crash',
+        'script':"return (await agent({stepId:'write',agentRef:'lead_agent',task:'synthetic-write'})).output;",'args':{},'unattended_recovery':sys.argv[4]=='1'},
+        replace(context(ChildService()),interaction='session'))
     await asyncio.Event().wait()
 asyncio.run(main())
 """
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "backend/tests"), str(root / "backend"), str(root / "examples/deerflow-extension-workflows")])}
-    child = await asyncio.create_subprocess_exec(sys.executable, "-c", program, json.dumps(service.config), str(external), str(host_state), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", program, json.dumps(service.config), str(external), str(host_state), "1" if stale_grant_scan else "0", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env
+    )
+    scan_entered, scan_release = asyncio.Event(), asyncio.Event()
+
+    async def paused_restore(**kwargs):
+        scan_entered.set()
+        await scan_release.wait()
+        return runs
+
     try:
         async with asyncio.timeout(40):
             line = await child.stdout.readline()
@@ -257,7 +271,9 @@ asyncio.run(main())
         identities = json.loads(line)
         child.kill()
         await child.wait()
-        await service.start(None)
+        await service.start(SimpleNamespace(agent_runs_restore=paused_restore) if stale_grant_scan else None)
+        if stale_grant_scan:
+            await asyncio.wait_for(scan_entered.wait(), 5)
         snapshot = await asyncio.to_thread(lambda: json.loads(host_state.read_text()))
         runs.threads = snapshot["threads"]
         observed = AgentRun(**snapshot["run"])
@@ -282,6 +298,12 @@ asyncio.run(main())
         }
         receipt = await actions["reconcile"](payload, session)
         assert receipt["status"] == "recoverable"
+        if stale_grant_scan:
+            scan_release.set()
+            await asyncio.wait_for(service.recovery_scan, 5)
+            record = await asyncio.to_thread(service.store.get, "alice", run_id)
+            assert record["status"] == "recoverable" and record["reconciliation_pending_recovery"] is True
+            assert run_id not in service.entries
         await service.stop()
         await service.start(None)
         assert await actions["reconcile"](payload, session) == receipt
@@ -293,6 +315,7 @@ asyncio.run(main())
         assert await asyncio.to_thread(external.read_text) == "external-write\n"
         assert len((await asyncio.to_thread(service.store.get, "alice", run_id))["resolutions"]) == 1
     finally:
+        scan_release.set()
         if child.returncode is None:
             child.kill()
             await child.wait()

@@ -36,13 +36,15 @@ class Recovery:
         from .service import text
 
         run_id = text(payload["run_id"], 64)
-        return await self.restore_body(self.owner(context), run_id, context.agent_runs)
+        return await self.restore_body(self.owner(context), run_id, context.agent_runs, session_recovery=True)
 
-    async def restore_body(self, owner, run_id, runs):
+    async def restore_body(self, owner, run_id, runs, *, session_recovery=False):
         from .service import identity
 
         async with self.launch_lock:
             record = await asyncio.to_thread(self.store.get, owner, run_id)
+            if record.get("reconciliation_pending_recovery") and not session_recovery:
+                raise ValueError("Reconciled workflow requires authenticated manual recovery")
             if run_id in self.entries:
                 return {"run_id": run_id, "status": record["status"]}
             if record["status"] != "recoverable" or record.get("recovery_version") != RECOVERY_VERSION:
