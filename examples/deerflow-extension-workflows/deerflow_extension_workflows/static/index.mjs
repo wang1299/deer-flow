@@ -51,6 +51,32 @@ function mount(root, context) {
   panel.append(node('h2',t('Script workflows','脚本工作流')),node('p',t('Versioned workflows with authenticated output review. After restart, sign in and recover compatible runs. Multi-Gateway control requires the shared PostgreSQL mode; takeover requires sign-in; uncertain child effects require reconciliation; no hard monetary budget. File approval covers a verified immutable snapshot; linked files require explicit capture.','版本化工作流支持登录用户成果确认。重启后请登录并恢复兼容的工作流。多 Gateway 控制需启用共享 PostgreSQL 模式；接管需要登录；不确定的子任务效果需要核对；无金额硬上限。文件确认针对经过哈希验证的不可覆盖快照；链接文件需显式捕获。')),notice,library,form,navigation,detail);
   root.append(sheet,panel);
   const alive = version => !disposed && !context.signal?.aborted && version === generation;
+  const reconciliationRequests = new Map();
+  function reconciliationForm(run, step) {
+    const box=node('fieldset','',{className:'reconciliation'});
+    box.append(node('legend',t(`Reconcile ${step.step_id} / attempt ${step.attempt}`,`核对 ${step.step_id} / 第 ${step.attempt} 次尝试`)),node('p',t('Inspect the exact child and external effects first. This records your decision; it does not approve output or resume execution.','请先核实此子任务和外部影响。此操作只记录处理决定，不确认成果，也不恢复执行。')));
+    const outcome=node('select','',{ariaLabel:t('Observed outcome','核实结果')});
+    for(const [value,en,zh] of [['unknown','Unknown — keep blocked','无法确认，保持阻塞'],['completed','Completed — reuse verified child result','已完成，复用核实后的子任务结果'],['no_effect','No external effect — authorize a new attempt','无外部影响，允许新尝试'],['compensated','External effects compensated — authorize a new attempt','外部影响已补偿，允许新尝试']])outcome.append(node('option',t(en,zh),{value}));
+    const child=node('input','',{ariaLabel:t('Child run ID','子任务运行 ID'),value:step.run_id||'',placeholder:t('Required if the admission receipt was lost','接收结果丢失时需要填写')});
+    if(step.run_id)child.readOnly=true;
+    const evidence=node('input','',{ariaLabel:t('Evidence reference','核实依据引用'),placeholder:'incident://…',maxLength:512});
+    box.append(node('pre',JSON.stringify({step_id:step.step_id,attempt:step.attempt,status:step.status,thread_id:step.thread_id,run_id:step.run_id,child_status:step.child_status,configuration_version:step.configuration_version},null,2)));
+    const confirmed=node('input','',{type:'checkbox'}), confirmation=node('label',t('I verified this attempt and the external outcome described above.','我已核实此尝试及上述外部结果。'),{className:'confirmation'});
+    confirmation.prepend(confirmed);
+    box.append(node('label',t('Observed outcome','核实结果')),outcome,node('label',t('Child run ID','子任务运行 ID')),child,node('label',t('Evidence reference (no secrets or conversation transcripts)','核实依据引用（请勿填写密钥或完整对话）')),evidence,confirmation);
+    box.append(button(t('Record reconciliation','记录处理决定'),async()=>{
+      if(!evidence.value.trim()||!confirmed.checked)throw Error(t('Provide an evidence reference and confirm the exact attempt.','请填写核实依据引用并确认此尝试。'));
+      const payload={run_id:run.run_id,step_id:step.step_id,attempt:step.attempt,revision:run.revision,outcome:outcome.value,evidence_ref:evidence.value};
+      if(child.value.trim())payload.child_run_id=child.value.trim();
+      const content=JSON.stringify(payload), key=`${run.run_id}:${step.step_id}`;
+      let request=reconciliationRequests.get(key);
+      if(request?.content!==content){request={content,id:Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('')};reconciliationRequests.set(key,request);}
+      await call('reconcile',{...payload,decision_id:request.id});
+      notice.textContent=t('Decision recorded. Inspect the current state before choosing Recover.','处理决定已记录。请检查当前状态，再选择是否恢复。');
+      await show();
+    }));
+    return box;
+  }
   async function call(action,payload) {
     const value=await context.callBackend(action,payload);
     if(disposed || context.signal?.aborted) throw Error('View closed');
@@ -87,7 +113,9 @@ function mount(root, context) {
         if(alive(version)&&id===selected)row.append(node('pre',JSON.stringify(value,null,2)));
       }));
       row.append(node('code',step.run_id||t('Run admission pending','等待 run admission')));detail.append(row);
+      if(['needs_reconciliation','recoverable'].includes(run.status)&&!['queued','completed'].includes(step.status))detail.append(reconciliationForm(run,step));
     }
+    if(run.resolutions?.length)detail.append(node('h4',t('Recent reconciliation decisions','最近的核对记录')),node('pre',JSON.stringify(run.resolutions,null,2)));
     for(const checkpoint of run.checkpoints||[]) {
       const review=node('section','',{className:'checkpoint'});
       review.append(node('h4',`${checkpoint.step_id} · ${checkpoint.status}`),node('pre',JSON.stringify(checkpoint,null,2)));
@@ -140,7 +168,7 @@ function mount(root, context) {
       detail.append(button(t('Cancel workflow','取消工作流'),async()=>{await call('cancel',{run_id:id});await show();}));
       clearTimeout(timer);if(['queued','running','cancelling'].includes(run.status))timer=setTimeout(()=>show().catch(e=>{if(!disposed)notice.textContent=e.message;}),2000);
     }else{
-      detail.append(button(t('Delete retained record','删除保留记录'),async()=>{await call('delete',{run_id:id});selected=null;generation++;detail.replaceChildren();await list();}));
+      if(run.status!=='needs_reconciliation')detail.append(button(t('Delete retained record','删除保留记录'),async()=>{await call('delete',{run_id:id});selected=null;generation++;detail.replaceChildren();await list();}));
       await list();
     }
   }

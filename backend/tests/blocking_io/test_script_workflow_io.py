@@ -38,3 +38,9 @@ async def test_file_capture_review_consumption_do_not_block_loop(plugin):
     from test_workflow_plugin import test_immutable_file_review_and_downstream_consume_same_version
 
     await test_immutable_file_review_and_downstream_consume_same_version(plugin)
+
+
+async def test_reconciliation_observation_and_commit_do_not_block_loop(plugin, monkeypatch):
+    from test_workflow_plugin import test_reconcile_completed_child_is_durable_and_never_repeats_effect
+
+    await test_reconcile_completed_child_is_durable_and_never_repeats_effect(plugin, monkeypatch)

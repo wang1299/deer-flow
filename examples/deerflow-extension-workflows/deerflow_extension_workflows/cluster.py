@@ -12,11 +12,7 @@ from .constants import NAMESPACE
 class Cluster:
     @staticmethod
     def slot_releasable(row):
-        return (
-            (row.get("admission_rejected") is True and row.get("run_id") is None)
-            or row["status"] in ("completed", "cancelled", "waiting_input")
-            or row.get("child_status") in ("success", "error", "interrupted", "timeout")
-        )
+        return (row.get("admission_rejected") is True and row.get("run_id") is None) or row["status"] in ("completed", "cancelled", "waiting_input") or row.get("child_status") in ("success", "error", "interrupted", "timeout")
 
     def dispatch_fence(self, record):
         if not self.clustered:
@@ -91,6 +87,7 @@ class Cluster:
         record = await asyncio.to_thread(self.store.claim, owner, run_id, for_cancel=True)
         entry = self.new_entry(owner, record, context.agent_runs)
         record["status"] = "cancelling"
+        record["cancel_requested"] = True
         await self.save(owner, record)
         self.entries[run_id] = entry
         guardian = asyncio.create_task(self.follow_lease(entry))

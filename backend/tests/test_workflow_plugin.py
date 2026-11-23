@@ -1,10 +1,12 @@
 """Script workflows through the public extension loader and an isolated JS worker."""
 
 import asyncio
+import copy
 import json
 import os
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -192,6 +194,313 @@ async def done(plugin, run_id):
     _, actions, service, runs = plugin
     await asyncio.wait_for(service.wait_idle(run_id), 10)
     return await actions["get"]({"run_id": run_id}, context(runs))
+
+
+async def lost_child_receipt(plugin, monkeypatch, *, task="write-once"):
+    """The child completes an effect, but the real supervisor loses its receipt."""
+    runs = plugin[3]
+    start = runs.start
+
+    async def lose_receipt(**kwargs):
+        run = await start(**kwargs)
+        await runs.wait(thread_id=run.thread_id, run_id=run.run_id)
+        raise AgentRunError(503, "Connection lost after admission")
+
+    monkeypatch.setattr(runs, "start", lose_receipt)
+    launched = await launch(plugin, "const a=await agent({stepId:'write',agentRef:'lead_agent',task:args.task}); return a.output;", args={"task": task})
+    final = await done(plugin, launched["run_id"])
+    assert final["status"] == "needs_reconciliation", final
+    monkeypatch.setattr(runs, "start", start)
+    record = await asyncio.to_thread(plugin[2].store.get, "alice", launched["run_id"])
+    return {
+        "run_id": launched["run_id"],
+        "step_id": "write",
+        "attempt": 1,
+        "revision": record["revision"],
+        "decision_id": "operator-decision-1",
+        "outcome": "completed",
+        "evidence_ref": "incident://test/child-observed",
+        "child_run_id": runs.starts[0][2],
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconcile_completed_child_is_durable_and_never_repeats_effect(plugin, monkeypatch):
+    _, actions, service, runs = plugin
+    payload = await lost_child_receipt(plugin, monkeypatch)
+    session = replace(context(runs), interaction="session")
+    receipt = await actions["reconcile"](payload, session)
+    assert receipt["status"] == "recoverable"
+    assert receipt == await actions["reconcile"](payload, session)
+    record = await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    assert record["resolutions"][0]["actor"] == "alice"
+    assert record["resolutions"][0]["decided_at"] > 0
+    assert record["resolutions"][0]["evidence_ref"] == payload["evidence_ref"]
+    assert record["steps"][0]["output"] == {"echo": "write-once"}
+    await actions["recover"]({"run_id": payload["run_id"]}, session)
+    final = await done(plugin, payload["run_id"])
+    assert final["status"] == "completed", final
+    assert final["result"] == {"echo": "write-once"}
+    assert len(runs.starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_requires_session_owner_and_exact_revision(plugin, monkeypatch):
+    _, actions, service, runs = plugin
+    payload = await lost_child_receipt(plugin, monkeypatch)
+    original = await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    for invalid_context in (context(runs), replace(context(runs, "bob"), interaction="session"), replace(context(runs), interaction="session", principal=ExtensionPrincipal("alice", is_internal=True))):
+        with pytest.raises((ValueError, AgentRunError)):
+            await actions["reconcile"](payload, invalid_context)
+    session = replace(context(runs), interaction="session")
+    runs.runs["unrelated"] = AgentRun("another-thread", "unrelated", "success")
+    for mutation in ({"revision": payload["revision"] - 1}, {"attempt": 2}, {"child_run_id": "unrelated"}):
+        with pytest.raises((ValueError, AgentRunError)):
+            await actions["reconcile"]({**payload, **mutation}, session)
+    assert original == await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    runs.denied = True
+    with pytest.raises(AgentRunError):
+        await actions["reconcile"](payload, session)
+    assert original == await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+
+
+@pytest.mark.asyncio
+async def test_reconcile_unknown_blocks_and_safe_retry_uses_new_attempt(plugin, monkeypatch):
+    _, actions, service, runs = plugin
+    payload = await lost_child_receipt(plugin, monkeypatch)
+    session = replace(context(runs), interaction="session")
+    unknown = {**payload, "outcome": "unknown"}
+    receipt = await actions["reconcile"](unknown, session)
+    assert receipt["status"] == "needs_reconciliation"
+    with pytest.raises(ValueError):
+        await actions["recover"]({"run_id": payload["run_id"]}, session)
+    with pytest.raises(ValueError):
+        await actions["delete"]({"run_id": payload["run_id"]}, session)
+    with pytest.raises(ValueError):
+        await actions["reconcile"](payload, session)  # same decision ID, changed outcome
+    old = copy.deepcopy(runs.starts[0])
+    retried = await actions["reconcile"]({**payload, "revision": receipt["revision"], "decision_id": "operator-decision-2", "outcome": "compensated"}, session)
+    assert retried["status"] == "recoverable"
+    await actions["recover"]({"run_id": payload["run_id"]}, session)
+    assert (await done(plugin, payload["run_id"]))["status"] == "completed"
+    assert len(runs.starts) == 2
+    assert runs.starts[1][0] != old[0] and runs.starts[1][2] != old[2]
+    assert runs.starts[1][1]["messages"][0]["id"] != old[1]["messages"][0]["id"]
+    record = await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    assert record["steps"][0]["attempt"] == 2
+    assert len(record["attempt_history"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["active", "advanced", "missing", "interrupt", "proof"])
+async def test_reconcile_never_commits_unverified_result(plugin, monkeypatch, invalid):
+    _, actions, service, runs = plugin
+    payload = await lost_child_receipt(plugin, monkeypatch)
+    original = await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    row = original["steps"][0]
+    if invalid == "active":
+        runs.runs[payload["child_run_id"]] = AgentRun(row["thread_id"], payload["child_run_id"], "running")
+    elif invalid == "advanced":
+        runs.threads[row["thread_id"]]["values"]["messages"].append({"role": "user", "content": "later turn"})
+    elif invalid == "missing":
+        runs.threads[row["thread_id"]]["values"]["messages"] = []
+    elif invalid == "interrupt":
+        runs.threads[row["thread_id"]]["interrupts"] = [{"value": "pending input"}]
+    else:
+
+        async def wrong_proof(**kwargs):
+            return {"source": "host_assembly", "thread_id": row["thread_id"], "run_id": "wrong-run", "version": "wrong"}
+
+        monkeypatch.setattr(runs, "configuration_evidence", wrong_proof)
+    with pytest.raises(ValueError):
+        await actions["reconcile"](payload, replace(context(runs), interaction="session"))
+    assert original == await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    assert len(runs.starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_pre_admission_failure_allows_one_explicit_retry(plugin, monkeypatch):
+    _, actions, service, runs = plugin
+    create = runs.create_thread
+    attempted = []
+
+    async def unavailable(**kwargs):
+        attempted.append(kwargs["thread_id"])
+        raise AgentRunError(503, "Thread creation unavailable before admission")
+
+    monkeypatch.setattr(runs, "create_thread", unavailable)
+    run_id = (await launch(plugin, "return (await agent({stepId:'write',agentRef:'lead_agent',task:1})).output;"))["run_id"]
+    assert (await done(plugin, run_id))["status"] == "needs_reconciliation"
+    assert len(attempted) == 1 and not runs.starts
+    monkeypatch.setattr(runs, "create_thread", create)
+    record = await asyncio.to_thread(service.store.get, "alice", run_id)
+    payload = {"run_id": run_id, "step_id": "write", "attempt": 1, "revision": record["revision"], "decision_id": "no-admission", "outcome": "no_effect", "evidence_ref": "incident://no-dispatch"}
+    session = replace(context(runs), interaction="session")
+    assert (await actions["reconcile"](payload, session))["status"] == "recoverable"
+    assert not runs.starts
+    await actions["recover"]({"run_id": run_id}, session)
+    assert (await done(plugin, run_id))["status"] == "completed"
+    assert len(runs.starts) == 1 and runs.starts[0][0] != attempted[0]
+
+
+@pytest.mark.asyncio
+async def test_reconcile_unidentified_admission_and_call_limit_stay_blocked(plugin, monkeypatch):
+    _, actions, service, runs = plugin
+    service.config["max_calls"] = 1
+    payload = await lost_child_receipt(plugin, monkeypatch)
+    session = replace(context(runs), interaction="session")
+    original = await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    unidentified = {k: v for k, v in payload.items() if k != "child_run_id"}
+    with pytest.raises(ValueError, match="Identify and observe"):
+        await actions["reconcile"]({**unidentified, "outcome": "no_effect"}, session)
+    with pytest.raises(ValueError, match="Total Agent call limit"):
+        await actions["reconcile"]({**payload, "outcome": "compensated"}, session)
+    assert original == await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    assert len(runs.starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconciled_parallel_child_reuses_sibling_and_still_requires_output_approval(plugin, monkeypatch):
+    _, actions, service, runs = plugin
+    start = runs.start
+
+    async def lose_second(**kwargs):
+        child = await start(**kwargs)
+        if json.loads(kwargs["input"]["messages"][0]["content"]) == "uncertain":
+            await runs.wait(thread_id=child.thread_id, run_id=child.run_id)
+            async with asyncio.timeout(5):
+                while not any(s["step_id"] == "a" and s["status"] == "completed" for s in next(iter(service.entries.values()))["record"]["steps"]):
+                    await asyncio.sleep(0)
+            raise AgentRunError(503, "Lost second child receipt")
+        return child
+
+    monkeypatch.setattr(runs, "start", lose_second)
+    script = (
+        "const r=await parallel([()=>agent({stepId:'a',agentRef:'lead_agent',task:'retained'}),()=>agent({stepId:'b',agentRef:'reviewer',task:'uncertain'})]); "
+        "await humanCheckpoint({stepId:'review',sourceStepId:'a',artifactVersion:r[0].artifactVersion}); return r.map(x=>x.output);"
+    )
+    run_id = (await launch(plugin, script))["run_id"]
+    assert (await done(plugin, run_id))["status"] == "needs_reconciliation"
+    monkeypatch.setattr(runs, "start", start)
+    record = await asyncio.to_thread(service.store.get, "alice", run_id)
+    sibling = next(s for s in record["steps"] if s["step_id"] == "a")
+    child_id = next(call[2] for call in runs.starts if json.loads(call[1]["messages"][0]["content"]) == "uncertain")
+    payload = {"run_id": run_id, "step_id": "b", "attempt": 1, "revision": record["revision"], "decision_id": "parallel-completed", "outcome": "completed", "evidence_ref": "incident://parallel/verified", "child_run_id": child_id}
+    session = replace(context(runs), interaction="session")
+    receipt = await actions["reconcile"](payload, session)
+    await actions["recover"]({"run_id": run_id}, session)
+    paused = await waiting(plugin, run_id, "waiting_approval")
+    assert len(runs.starts) == 2
+    assert paused["checkpoints"][0]["status"] == "pending"
+    assert paused["checkpoints"][0]["artifact_version"] == sibling["artifact_version"]
+    assert await actions["reconcile"](payload, session) == receipt
+    await actions["decide"]({"run_id": run_id, "step_id": "review", "attempt": 1, "artifact_version": sibling["artifact_version"], "decision": "approve"}, session)
+    assert (await done(plugin, run_id))["status"] == "completed"
+    assert len(runs.starts) == 2
+
+
+@pytest.mark.asyncio
+async def test_disconnected_reconciliation_commits_once_and_survives_restart(plugin, monkeypatch):
+    import threading
+
+    _, actions, service, runs = plugin
+    payload = await lost_child_receipt(plugin, monkeypatch)
+    entered, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    original = service.store.reconcile
+
+    def delayed_commit(*args):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        return original(*args)
+
+    monkeypatch.setattr(service.store, "reconcile", delayed_commit)
+    session = replace(context(runs), interaction="session")
+    caller = asyncio.create_task(actions["reconcile"](payload, session))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert service.write_lock.locked()
+    finally:
+        release.set()
+        await asyncio.gather(caller, *list(service.admissions), return_exceptions=True)
+    await service.stop()
+    await service.start(None)
+    receipt = await actions["reconcile"](payload, session)
+    assert receipt["status"] == "recoverable"
+    record = await asyncio.to_thread(service.store.get, "alice", payload["run_id"])
+    assert len(record["resolutions"]) == 1
+    await actions["recover"]({"run_id": payload["run_id"]}, session)
+    assert (await done(plugin, payload["run_id"]))["status"] == "completed"
+    assert len(runs.starts) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_real_gateway_capability_rechecks_revocation_before_commit(plugin, gateway_runtime, host, tmp_path):
+    """Real host admission/graph/assembly evidence and live account guards."""
+    _, actions, service, _ = plugin
+    bound, state, request, _, _ = gateway_runtime
+    _, _, load_user = host
+    owner = str(request.state.user.id)
+    # Host assembly imports on mounted development volumes are outside the
+    # extension's fast fake-child fixture; this test uses a realistic allowance.
+    service.config.update(timeout_seconds=60, admission_timeout_seconds=30)
+    writes = tmp_path / "gateway-external-write.txt"
+
+    async def external_write(prompt, runtime):
+        await asyncio.to_thread(writes.write_text, "committed", encoding="utf-8")
+
+    state.present_worker_report = external_write
+
+    class LostReceipt:
+        child = None
+        revoke_on_evidence = False
+
+        def __getattr__(self, name):
+            return getattr(bound, name)
+
+        async def start(self, **kwargs):
+            self.child = await bound.start(**kwargs)
+            assert (await bound.wait(thread_id=self.child.thread_id, run_id=self.child.run_id, timeout=25)).status == "success"
+            raise AgentRunError(503, "Lost receipt after real Gateway admission")
+
+        async def configuration_evidence(self, **kwargs):
+            result = await bound.configuration_evidence(**kwargs)
+            if self.revoke_on_evidence:
+                load_user.return_value = request.state.user.model_copy(update={"disabled": True})
+            return result
+
+    capability = LostReceipt()
+    session = ActionContext(ExtensionPrincipal(owner), {"enabled": True}, agent_runs=capability, interaction="session")
+    run_id = (await actions["launch"]({"request_id": "real-reconcile", "script": "return (await agent({stepId:'write',agentRef:'lead_agent',task:'synthetic-external-write'})).output;", "args": {}}, session))["run_id"]
+    await asyncio.wait_for(service.wait_idle(run_id), 40)
+    record = await asyncio.to_thread(service.store.get, owner, run_id)
+    assert record["status"] == "needs_reconciliation", record
+    assert await asyncio.to_thread(writes.read_text, encoding="utf-8") == "committed"
+    payload = {
+        "run_id": run_id,
+        "step_id": "write",
+        "attempt": 1,
+        "revision": record["revision"],
+        "decision_id": "real-host-evidence",
+        "outcome": "completed",
+        "evidence_ref": "incident://gateway/observed",
+        "child_run_id": capability.child.run_id,
+    }
+    capability.revoke_on_evidence = True
+    try:
+        with pytest.raises(AgentRunError, match="revoked"):
+            await actions["reconcile"](payload, session)
+        assert record == await asyncio.to_thread(service.store.get, owner, run_id)
+    finally:
+        load_user.return_value = request.state.user
+        capability.revoke_on_evidence = False
+    assert (await actions["reconcile"](payload, session))["status"] == "recoverable"
+    await actions["recover"]({"run_id": run_id}, session)
+    await asyncio.wait_for(service.wait_idle(run_id), 15)
+    assert (await actions["get"]({"run_id": run_id}, session))["status"] == "completed"
 
 
 @pytest.mark.asyncio

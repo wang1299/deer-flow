@@ -190,6 +190,21 @@ class PostgresStore(Store):
             self._lease(db, owner, record)
             db.execute("DELETE FROM workflow_slots WHERE workflow=? AND step=?", (record["id"], step))
 
+    def reconciliation_clock(self, db, owner, record):
+        run_id = record["id"]
+        lease = db.execute("SELECT expires_at FROM extension_execution_leases WHERE namespace=? AND resource_id=? AND user_id=? FOR UPDATE", (NAMESPACE, run_id, owner)).fetchone()
+        now = float(db.execute("SELECT extract(epoch from clock_timestamp())").fetchone()[0])
+        if lease and lease[0] > now:
+            raise ValueError("Workflow owned by a live Gateway; wait for cleanup or lease expiry")
+        if db.execute("SELECT 1 FROM workflow_controls WHERE workflow=? AND key='cancel'", (run_id,)).fetchone():
+            if record["status"] != "needs_reconciliation":
+                raise ValueError("Cancellation pending; complete cancellation cleanup before reconciliation")
+            record["cancel_requested"] = True
+        return now
+
+    def reconciliation_release(self, db, run_id, step_id):
+        return db.execute("DELETE FROM workflow_slots WHERE workflow=? AND step=?", (run_id, step_id)).rowcount
+
     def save_definition(self, owner, name, version, script):
         # Explicit columns: PostgreSQL also stores an ordering identity.
         with closing(self.connect()) as db, db:
@@ -210,8 +225,7 @@ class PostgresStore(Store):
     def get(self, owner, run_id):
         with closing(self.connect(readonly=True)) as db:
             row = db.execute(
-                "SELECT w.data,l.expires_at > extract(epoch from clock_timestamp()) FROM workflows w LEFT JOIN extension_execution_leases l "
-                "ON l.namespace=? AND l.resource_id=w.id AND l.user_id=w.owner WHERE w.owner=? AND w.id=?",
+                "SELECT w.data,l.expires_at > extract(epoch from clock_timestamp()) FROM workflows w LEFT JOIN extension_execution_leases l ON l.namespace=? AND l.resource_id=w.id AND l.user_id=w.owner WHERE w.owner=? AND w.id=?",
                 (NAMESPACE, owner, run_id),
             ).fetchone()
             if not row:
@@ -232,6 +246,8 @@ class PostgresStore(Store):
             row = db.execute("SELECT status FROM workflows WHERE owner=? AND id=?", (owner, run_id)).fetchone()
             if not row or row[0] not in TERMINAL:
                 raise ValueError("Only finished workflow records can be deleted")
+            if row[0] == "needs_reconciliation":
+                raise ValueError("Reconcile retained child reservations before deleting")
             lease = db.execute("SELECT expires_at > extract(epoch from clock_timestamp()) FROM extension_execution_leases WHERE namespace=? AND resource_id=? FOR UPDATE", (NAMESPACE, run_id)).fetchone()
             if lease and lease[0]:
                 raise ValueError("Workflow still has an execution owner")

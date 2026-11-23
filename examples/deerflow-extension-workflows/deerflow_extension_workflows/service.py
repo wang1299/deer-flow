@@ -20,6 +20,7 @@ from .cluster import Cluster
 from .constants import NAMESPACE as NAMESPACE
 from .lifecycle import Lifecycle
 from .postgres import LeaseLost
+from .reconciliation import Reconciliation
 from .recovery import RECOVERY_VERSION, Recovery
 from .store import TERMINAL, Store
 
@@ -70,6 +71,7 @@ def project(record, detail=True):
         fingerprint=record["fingerprint"],
         definition=record.get("definition"),
         configuration_revision=record.get("configuration_revision"),
+        revision=record.get("revision", 0),
     )
     if detail:
         result.update(
@@ -80,6 +82,8 @@ def project(record, detail=True):
             args=record["args"],
             logs=record["logs"],
             result=record.get("result"),
+            resolutions=[{k: v for k, v in item.items() if k not in ("request", "receipt")} for item in record.get("resolutions", [])[-8:]],
+            resolution_count=len(record.get("resolutions", [])),
             steps=[
                 {
                     k: v
@@ -99,7 +103,7 @@ def project(record, detail=True):
     return result
 
 
-class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
+class Workflows(Cluster, Recovery, Reconciliation, Lifecycle, Artifacts):
     def __init__(self, config):
         self.config = config
         self.clustered = bool(config.get("storage_url"))
@@ -147,6 +151,8 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
                     "worker.py",
                     "service.py",
                     "recovery.py",
+                    "reconciliation.py",
+                    "store.py",
                     "lifecycle.py",
                     "artifacts.py",
                     "cluster.py",
@@ -444,6 +450,7 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
                 return await self.cancel_recovered(owner, run_id, context)
             if entry:
                 entry["cancel"].set()
+                entry["record"]["cancel_requested"] = True
                 entry["suspending"] = False
                 if entry["record"]["status"] not in TERMINAL:
                     entry["record"]["status"] = "cancelling"
@@ -458,6 +465,7 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
                 if context.agent_runs is None:
                     raise ValueError("Session-bound AgentRuns required")
                 record["status"] = "cancelling"
+                record["cancel_requested"] = True
                 self._revoke_grant(record)
                 await self.save(owner, record)
                 for row in record["steps"]:
@@ -514,8 +522,10 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
                     "artifact_instruction": "Read these exact versions using read_workflow_artifact (run_id, version, offset). Follow next_offset until null. Do not use source file paths.",
                 }
             # Stable identity/input are recorded BEFORE thread creation or run admission.
-            thread_id = "workflow-" + identity([record["id"], step_id])[:32]
-            message_id = "workflow-" + identity([record["id"], step_id, 1])[:32]
+            existing = next((s for s in record["steps"] if s["step_id"] == step_id), None) if replay else None
+            attempt = existing["attempt"] if existing else 1
+            thread_id = "workflow-" + identity([record["id"], step_id] if attempt == 1 else [record["id"], step_id, attempt])[:32]
+            message_id = "workflow-" + identity([record["id"], step_id, attempt])[:32]
             input = {
                 "messages": [
                     {
@@ -525,9 +535,10 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
                     }
                 ]
             }
-            existing = next((s for s in record["steps"] if s["step_id"] == step_id), None) if replay else None
             if existing:
                 row = existing
+                if "bridge_id" in row and row["bridge_id"] != message["id"]:
+                    raise ValueError("Step ID already used by a different bridge request")
                 if row["input"] != input or row["agent_ref"] != payload["agentRef"]:
                     raise ValueError("Recovery step input changed")
                 if row["status"] == "completed":
@@ -539,16 +550,18 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
             if not existing:
                 if any(s["step_id"] == step_id for s in record["steps"] + record.get("checkpoints", []) + record.get("artifacts", [])):
                     raise ValueError("Step ID already used")
-                if len(record["steps"]) >= self.config["max_calls"]:
+                if sum(s["attempt"] for s in record["steps"]) >= self.config["max_calls"]:
                     entry["fault"] = "Total Agent call limit"
                     raise ValueError(entry["fault"])
                 row = {
                     "step_id": step_id,
+                    "bridge_id": message["id"],
                     "attempt": 1,
                     "agent_ref": payload["agentRef"],
                     "thread_id": thread_id,
                     "run_id": None,
                     "status": "queued",
+                    "admission_started": False,
                     "input": input,
                     "input_artifacts": references,
                     "idempotency_key": f"{record['id']}:{message_id}:1",
@@ -582,7 +595,7 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
                         if entry["cancel"].is_set():
                             row["status"] = "cancelled"
                             raise ValueError("Workflow stopping")
-                        row["status"] = "admitting"
+                        row.update(status="admitting", admission_started=True)
                         await self.save(owner, record)
                         run = await runs.start(
                             thread_id=thread_id,
@@ -609,58 +622,12 @@ class Workflows(Cluster, Recovery, Lifecycle, Artifacts):
                         break
                     await asyncio.sleep(0.02)
                 row.update(child_status=run.status, stop_reason=run.stop_reason)
-                async with asyncio.timeout(5):
-                    state = await runs.get_state(thread_id=thread_id)
-                messages = state.get("values", {}).get("messages", [])
-                if state.get("next") or state.get("interrupts") or pending_input(messages):
-                    row["status"] = "waiting_input"
-                    entry["fault"] = "waiting_input"
-                    raise ValueError("Child requires input; workflow resume cannot answer child interrupts")
-                if run.status != "success":
-                    row["status"] = "failed"
-                    raise ValueError("Agent run did not succeed")
-                # Dynamic context keeps X on a hidden system reminder and moves
-                # the visible human input to X__user. Never anchor on the reminder
-                # or hidden memory; genuinely later human messages still conflict.
-                marker = next(
-                    (
-                        i
-                        for i, m in enumerate(messages)
-                        if m.get("type", m.get("role")) in ("human", "user")
-                        and not m.get("additional_kwargs", {}).get("hide_from_ui")
-                        and (m.get("id") in (message_id, f"{message_id}__user") or m.get("additional_kwargs", {}).get("run_id") == run.run_id)
-                    ),
-                    None,
-                )
-                if marker is None or any(m.get("type", m.get("role")) in ("human", "user") for m in messages[marker + 1 :]):
-                    row["status"] = "result_conflict"
-                    raise ValueError("Thread advanced before result collection")
-                answers = [m for m in messages[marker + 1 :] if m.get("type", m.get("role")) in ("ai", "assistant") and not m.get("tool_calls")]
-                if not answers:
-                    raise ValueError("Agent completed without an answer")
-                content = answers[-1].get("content")
-                if isinstance(content, str):
-                    try:
-                        output = json.loads(content)
-                    except ValueError:
-                        output = content
-                else:
-                    output = content
-                encoded(output, AGENT_OUTPUT_BYTES)
-                # Evidence comes from the run's completed host assembly, never a
-                # fresh read of mutable configuration after the Agent finishes.
-                async with asyncio.timeout(5):
-                    proof = await runs.configuration_evidence(thread_id=thread_id, run_id=run.run_id)
-                if proof.get("run_id") != run.run_id or proof.get("thread_id") != thread_id or proof.get("source") != "host_assembly":
-                    raise ValueError("Host configuration evidence does not match child run")
-                row["configuration_evidence"] = proof
-                row["configuration_version"] = proof["version"]
-                # Capture before any later turn can alter the thread checkpoint.
-                row.update(
-                    status="completed",
-                    output=copy.deepcopy(output),
-                    artifact_version=identity([record["id"], step_id, row["attempt"], output]),
-                )
+                try:
+                    await self.collect_result(runs, record, row, run)
+                except ValueError:
+                    if row["status"] == "waiting_input":
+                        entry["fault"] = "waiting_input"
+                    raise
                 response["value"] = self.step_result(row)
         except TimeoutError:
             if row and row["run_id"] is not None:

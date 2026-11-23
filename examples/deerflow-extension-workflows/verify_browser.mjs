@@ -28,6 +28,7 @@ const server=createServer(async(req,res)=>{
         if(action==='get_step'&&window.fileReview)return {kind:'file',name:'report.txt',size:bytes.length,sha256:window.badHash?'bad':hash,artifact_version:'artifact-v1'};
         if(action==='get_step')return {output:{report:'Retained <img src=x onerror=alert(1)> report'},artifact_version:'artifact-v1'};
         if(action==='decide'){window.state='completed';return {status:'approved'};}
+        if(action==='reconcile'){if(window.loseReconcile-- > 0)throw Error('Reconciliation response lost');window.state=payload.outcome==='unknown'?'needs_reconciliation':'recoverable';return {status:window.state};}
         if(action==='recover'){window.state='paused';return {status:'queued'};}
         if(action==='resume'){window.state='completed';return {status:'resumed'};}
         if(action==='launch'){saved=payload;identities.add(payload.request_id);if(window.loseLaunch-- > 0)throw Error('Launch response lost');return {run_id:'fixture-run',status:'queued'};}
@@ -36,7 +37,7 @@ const server=createServer(async(req,res)=>{
         if(action==='list')return {runs:saved&&!window.hidden?[{run_id:'fixture-run',status:window.state}]:[]};
         if(action==='cancel'){window.state='cancelled';return {status:'cancelling'};}
         if(action==='delete'){window.hidden=true;return {deleted:true};}
-        if(action==='get')return {fingerprint:'fingerprint',checkpoints:(window.state==='waiting_approval'||(window.fileReview&&window.state==='completed'))?[{step_id:'confirm',attempt:1,kind:'humanCheckpoint',status:window.state==='completed'?'approved':'pending',source_step_id:'check',artifact_version:'artifact-v1'}]:window.state==='paused'?[{step_id:'p',attempt:1,kind:'pause',status:'pending'}]:[],run_id:'fixture-run',status:window.state,script:saved.script,args:saved.args,script_hash:'script-version',args_hash:'args-version',limits:{concurrency:2,max_calls:8},steps:[{step_id:'check',agent_ref:'lead_agent',status:window.state,thread_id:'child-thread',run_id:'child-run'}],logs:['Checking'],result:'<img src=x onerror=alert(1)>'};
+        if(action==='get')return {revision:7,resolutions:[],fingerprint:'fingerprint',checkpoints:(window.state==='waiting_approval'||(window.fileReview&&window.state==='completed'))?[{step_id:'confirm',attempt:1,kind:'humanCheckpoint',status:window.state==='completed'?'approved':'pending',source_step_id:'check',artifact_version:'artifact-v1'}]:window.state==='paused'?[{step_id:'p',attempt:1,kind:'pause',status:'pending'}]:[],run_id:'fixture-run',status:window.state,script:saved.script,args:saved.args,script_hash:'script-version',args_hash:'args-version',limits:{concurrency:2,max_calls:8},steps:[{step_id:'check',attempt:1,agent_ref:'lead_agent',status:window.state,thread_id:'child-thread',run_id:'child-run'}],logs:['Checking'],result:'<img src=x onerror=alert(1)>'};
       }});
   </script></body></html>`);
 });
@@ -143,10 +144,38 @@ try{
   await page.getByLabel('Script',{exact:true}).fill('return "explicit edit";');
   await page.getByRole('button',{name:'Launch workflow',exact:true}).click();
   await page.waitForFunction(()=>calls.filter(c=>c.action==='launch').at(-1).payload.script==='return "explicit edit";');
+  await page.evaluate(()=>{window.state='needs_reconciliation';window.loseReconcile=1;window.fileReview=false;});
+  await page.locator('nav button').first().click();
+  await page.getByRole('group',{name:'Reconcile check / attempt 1',exact:true}).waitFor();
+  assert.equal(await page.getByRole('button',{name:'Delete retained record',exact:true}).count(),0);
+  const recoverBefore=await page.evaluate(()=>calls.filter(c=>c.action==='recover').length);
+  await page.getByRole('button',{name:'Record reconciliation',exact:true}).click();
+  assert.equal(await page.evaluate(()=>calls.filter(c=>c.action==='reconcile').length),0);
+  await page.getByLabel('Evidence reference',{exact:true}).fill('incident://synthetic/<img onerror=alert(1)>');
+  await page.getByRole('checkbox').check();
+  await page.getByRole('button',{name:'Record reconciliation',exact:true}).click();
+  await page.waitForFunction(()=>document.querySelector('[role=status]').textContent.includes('Reconciliation response lost'));
+  await page.getByRole('button',{name:'Record reconciliation',exact:true}).click();
+  const resolutions=await page.evaluate(()=>calls.filter(c=>c.action==='reconcile'));
+  assert.equal(resolutions.length,2);
+  assert.deepEqual(resolutions[0].payload,resolutions[1].payload);
+  assert.equal(resolutions[0].payload.revision,7);
+  assert.equal(resolutions[0].payload.attempt,1);
+  assert.equal(resolutions[0].payload.outcome,'unknown');
+  assert.equal(resolutions[0].payload.child_run_id,'child-run');
+  assert.equal(resolutions[0].payload.decision_id.length,32);
+  await page.getByLabel('Observed outcome',{exact:true}).selectOption('completed');
+  await page.getByLabel('Evidence reference',{exact:true}).fill('incident://synthetic/verified-child');
+  await page.getByRole('checkbox').check();
+  await page.getByRole('button',{name:'Record reconciliation',exact:true}).click();
+  await page.getByRole('button',{name:'Recover workflow',exact:true}).waitFor();
+  assert.equal(await page.evaluate(()=>calls.filter(c=>c.action==='recover').length),recoverBefore);
+  assert.equal(await page.locator('img').count(),0);
+  if(process.env.WORKFLOW_SCREENSHOT)await page.screenshot({path:process.env.WORKFLOW_SCREENSHOT,fullPage:true});
   await page.evaluate(()=>view.dispose());
   assert.equal(await page.locator('.script-workflows').count(),0);
   assert.deepEqual(errors,[]);
-  console.log('Browser checks passed: launch retries, saved versions, exact-output review, approval, resume, child navigation, cancellation, escaped output, deletion and disposal.');
+  console.log('Browser checks passed: exact-attempt reconciliation, duplicate decision IDs, explicit recovery, launch retries, saved versions, exact-output review, approval, resume, child navigation, cancellation, escaped output, deletion and disposal.');
 }finally{
   await browser.close();await new Promise(resolve=>server.close(resolve));
 }

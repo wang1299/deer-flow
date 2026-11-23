@@ -12,7 +12,7 @@ from test_workflow_plugin import context, done, launch, waiting
 plugin = fixtures.plugin
 
 
-pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(os.name != "posix", reason="Workflow execution requires POSIX")]
+pytestmark = [pytest.mark.bundled_extension, pytest.mark.asyncio, pytest.mark.skipif(os.name != "posix", reason="Workflow execution requires POSIX")]
 
 
 async def restart_snapshot(plugin, run_id):
@@ -202,6 +202,95 @@ asyncio.run(main())
         assert final["status"] == "completed", final
         assert final["result"] == {"echo": 1}
         assert not runs.starts
+    finally:
+        if child.returncode is None:
+            child.kill()
+            await child.wait()
+
+
+async def test_external_write_then_process_death_requires_durable_reconciliation(plugin, tmp_path):
+    """Real SIGKILL + SQLite/JS worker; the outer child service is controlled."""
+    import json
+    import sys
+    from pathlib import Path
+
+    from deerflow_extension_api import AgentRun
+
+    _, actions, service, runs = plugin
+    await service.stop()
+    root = Path(__file__).resolve().parents[2]
+    external = tmp_path / "external-writes.txt"
+    host_state = tmp_path / "child-service.json"
+    program = r"""
+import asyncio,json,os,sys
+from pathlib import Path
+from deerflow_extension_workflows.service import Workflows
+from test_workflow_plugin import Runs,context
+
+class ChildService(Runs):
+    async def start(self, **kwargs):
+        child=await super().start(**kwargs)
+        child=await self.wait(thread_id=child.thread_id,run_id=child.run_id)
+        # Synthetic external system commits independently from workflow storage.
+        def commit():
+            with Path(sys.argv[2]).open('a') as target:
+                target.write('external-write\n');target.flush();os.fsync(target.fileno())
+            Path(sys.argv[3]).write_text(json.dumps({'threads':self.threads,'run':{
+                'thread_id':child.thread_id,'run_id':child.run_id,'status':child.status}}))
+        await asyncio.to_thread(commit)
+        print(json.dumps({'run_id':kwargs['idempotency_key'].split(':')[0],'child_run_id':child.run_id}),flush=True)
+        # Lose the Gateway before returning the child admission/result receipt.
+        await asyncio.Event().wait()
+
+async def main():
+    service=Workflows(json.loads(sys.argv[1]));await service.start(None)
+    await service.launch({'request_id':'external-crash','script':"return (await agent({stepId:'write',agentRef:'lead_agent',task:'synthetic-write'})).output;",'args':{}},context(ChildService()))
+    await asyncio.Event().wait()
+asyncio.run(main())
+"""
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "backend/tests"), str(root / "backend"), str(root / "examples/deerflow-extension-workflows")])}
+    child = await asyncio.create_subprocess_exec(sys.executable, "-c", program, json.dumps(service.config), str(external), str(host_state), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+    try:
+        async with asyncio.timeout(40):
+            line = await child.stdout.readline()
+        assert line, (await child.stderr.read()).decode()[:2000]
+        identities = json.loads(line)
+        child.kill()
+        await child.wait()
+        await service.start(None)
+        snapshot = await asyncio.to_thread(lambda: json.loads(host_state.read_text()))
+        runs.threads = snapshot["threads"]
+        observed = AgentRun(**snapshot["run"])
+        runs.runs[observed.run_id] = observed
+        session = replace(context(runs), interaction="session")
+        run_id = identities["run_id"]
+        assert (await actions["recover"]({"run_id": run_id}, session))["status"] == "needs_reconciliation"
+        assert not runs.starts
+        with pytest.raises(ValueError):
+            await actions["recover"]({"run_id": run_id}, session)
+        record = await asyncio.to_thread(service.store.get, "alice", run_id)
+        payload = {
+            "run_id": run_id,
+            "step_id": "write",
+            "attempt": 1,
+            "revision": record["revision"],
+            "decision_id": "verified-external-write",
+            "outcome": "completed",
+            "evidence_ref": "incident://external-write/committed",
+            "child_run_id": identities["child_run_id"],
+        }
+        receipt = await actions["reconcile"](payload, session)
+        assert receipt["status"] == "recoverable"
+        await service.stop()
+        await service.start(None)
+        assert await actions["reconcile"](payload, session) == receipt
+        await actions["recover"]({"run_id": run_id}, session)
+        final = await done(plugin, run_id)
+        assert final["status"] == "completed", final
+        assert final["result"] == {"echo": "synthetic-write"}
+        assert not runs.starts
+        assert await asyncio.to_thread(external.read_text) == "external-write\n"
+        assert len((await asyncio.to_thread(service.store.get, "alice", run_id))["resolutions"]) == 1
     finally:
         if child.returncode is None:
             child.kill()

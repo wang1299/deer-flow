@@ -12,6 +12,70 @@ script verdicts, tool permission approval and human output approval remain separ
 Compatible workflows can be recovered after restart or, in PostgreSQL mode, on another Gateway after lease expiry.
 No arbitrary JavaScript continuation serialization or hard monetary budget is provided.
 
+## Resolve an uncertain child attempt
+
+In **Script workflows**, open a `needs_reconciliation` run (or a recoverable run
+with an uncertain child). Inspect the displayed step, attempt, child thread/run,
+state and host-assembly version. Inspect the external system separately. The
+workflow owner must sign in again after a restart or when using another Gateway;
+an administrator role does not bypass ownership. A live execution lease or local
+supervisor prevents reconciliation until execution/cleanup has ended.
+
+Choose one verified outcome, enter a short evidence reference (maximum 512 UTF-8
+bytes, without credentials or conversation transcripts), and confirm the exact
+attempt:
+
+| Outcome | Effect |
+| --- | --- |
+| **Unknown** | Record the investigation and keep dependents and any retained capacity blocked. |
+| **Completed** | Observe a successful child and copy its bounded, attributable result. A missing, advanced, interrupted or unbound result cannot advance dependents. |
+| **No external effect** | Explicitly authorize one new attempt after observing the old child terminal, or after durable proof that admission was rejected/not started. |
+| **External effects compensated** | Explicitly attest that the external effects were safely compensated and authorize one new attempt under the same observation requirement. |
+
+If the admission receipt was lost, supply the child run ID from the displayed
+stable thread. The host checks that identity against the owner's thread and the
+persisted input; an arbitrary run or operator assertion cannot substitute for an
+observable terminal child. An unidentified, possibly active admission remains
+blocked. A terminal run alone is **not** proof that it had no external effect.
+
+**Record reconciliation** commits the decision, actor, timestamp, evidence,
+attempt transition and retained PostgreSQL reservation release together. Repeating
+the same decision returns its original receipt; a changed payload or stale
+revision must be reloaded. Competing decisions cannot both commit. The recent
+audit is visible on the run; the bounded complete audit remains in workflow
+storage. Unresolved runs cannot be deleted to discard their uncertainty.
+
+Reconciliation never dispatches a child. After all blocked attempts are resolved,
+choose **Recover workflow** explicitly. Recovery rechecks current permissions,
+configuration and runtime compatibility. Completed siblings reuse their retained
+output; a safe retry gets a new attempt, thread, input-message and idempotency
+identity and counts against `max_calls`. Changed replay inputs fail closed.
+The last durable execution allowance is preserved rather than reset. Existing
+human output checkpoints still require their own exact-version approval.
+Cancellation remains binding: after cancellation cleanup, a completed-child
+reconciliation can release retained capacity, but cannot resurrect the workflow
+or authorize a retry. Finish pending cancellation cleanup before reconciling.
+
+The session-only backend action is `reconcile` (not a model tool):
+
+```json
+{
+  "run_id": "<workflow ID>",
+  "step_id": "write",
+  "attempt": 1,
+  "revision": 17,
+  "decision_id": "<stable ID for this unchanged decision>",
+  "outcome": "completed",
+  "evidence_ref": "incident://example/verified-write",
+  "child_run_id": "<observed child ID, required for a lost receipt>"
+}
+```
+
+Outcomes are `unknown`, `completed`, `no_effect` and `compensated`. `revision`
+comes from `get`; omit `child_run_id` when the stored attempt already identifies
+its child. Runtime upgrades retain the existing conservative replay guard: this
+does not migrate incompatible workflows or manufacture missing historical output.
+
 ## Install and enable
 
 Requires a POSIX Gateway (Linux/macOS), Python 3.12+, the public extension API 0.2.9,

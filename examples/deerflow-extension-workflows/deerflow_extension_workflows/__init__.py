@@ -118,6 +118,7 @@ def install(registry, config):
                         "get_definition",
                         "resume",
                         "recover",
+                        "reconcile",
                         "decide",
                         "get_step",
                         "get_artifact",

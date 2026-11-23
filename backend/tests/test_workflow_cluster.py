@@ -11,7 +11,7 @@ import test_workflow_plugin as fixtures
 from test_workflow_plugin import context
 
 plugin = fixtures.plugin
-pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(not os.getenv("DEERFLOW_TEST_WORKFLOW_POSTGRES"), reason="Requires dedicated PostgreSQL")]
+pytestmark = [pytest.mark.bundled_extension, pytest.mark.asyncio, pytest.mark.skipif(not os.getenv("DEERFLOW_TEST_WORKFLOW_POSTGRES"), reason="Requires dedicated PostgreSQL")]
 
 
 @pytest_asyncio.fixture
@@ -74,6 +74,118 @@ async def test_launch_on_a_resume_on_b(cluster):
     await b.resume(dict(run_id=run_id, fingerprint=record["fingerprint"], step_id="p", attempt=1), context(runs))
     await asyncio.wait_for(asyncio.gather(a.wait_idle(run_id), b.wait_idle(run_id)), 10)
     assert (await b.get({"run_id": run_id}, context(runs)))["result"] == 42
+
+
+async def lost_cluster_receipt(cluster, monkeypatch, *, cancel=False):
+    a, _, runs = cluster
+    original = runs.start
+
+    async def lose_receipt(**kwargs):
+        child = await original(**kwargs)
+        await runs.wait(thread_id=child.thread_id, run_id=child.run_id)
+        if cancel:
+            await cluster[1].cancel({"run_id": kwargs["idempotency_key"].split(":")[0]}, replace(context(runs), interaction="session"))
+        from deerflow_extension_api import AgentRunError
+
+        raise AgentRunError(503, "Lost receipt after child effect")
+
+    monkeypatch.setattr(runs, "start", lose_receipt)
+    run_id = (await a.launch({"request_id": "reconcile", "script": "return (await agent({stepId:'write',agentRef:'lead_agent',task:'external-write'})).output;", "args": {}}, context(runs)))["run_id"]
+    await asyncio.wait_for(a.wait_idle(run_id), 10)
+    monkeypatch.setattr(runs, "start", original)
+    record = await asyncio.to_thread(a.store.get, "alice", run_id)
+    assert record["status"] == "needs_reconciliation", record
+    return {"run_id": run_id, "step_id": "write", "attempt": 1, "revision": record["revision"], "decision_id": "cluster-complete", "outcome": "completed", "evidence_ref": "incident://cluster/verified", "child_run_id": runs.starts[0][2]}
+
+
+def retained_slots(service, run_id):
+    from contextlib import closing
+
+    with closing(service.store.connect(readonly=True)) as db:
+        return db.execute("SELECT count(*) FROM workflow_slots WHERE workflow=?", (run_id,)).fetchone()[0]
+
+
+async def test_reconciliation_across_gateways_is_atomic_and_idempotent(cluster, monkeypatch):
+    a, b, runs = cluster
+    payload = await lost_cluster_receipt(cluster, monkeypatch)
+    assert await asyncio.to_thread(retained_slots, a, payload["run_id"]) == 1
+    session = replace(context(runs), interaction="session")
+    first, second = await asyncio.gather(a.reconcile(payload, session), b.reconcile(payload, session))
+    assert first == second and first["status"] == "recoverable"
+    record = await asyncio.to_thread(b.store.get, "alice", payload["run_id"])
+    assert len(record["resolutions"]) == 1
+    assert record["resolutions"][0]["reservations_released"] == 1
+    assert await asyncio.to_thread(retained_slots, a, payload["run_id"]) == 0
+    await b.recover({"run_id": payload["run_id"]}, session)
+    await asyncio.wait_for(b.wait_idle(payload["run_id"]), 10)
+    assert (await b.get({"run_id": payload["run_id"]}, session))["status"] == "completed"
+    assert len(runs.starts) == 1
+    assert await a.reconcile(payload, session) == first
+
+
+async def test_reconciliation_rollback_retains_reservation_and_competing_decision_loses(cluster, monkeypatch):
+    a, b, runs = cluster
+    payload = await lost_cluster_receipt(cluster, monkeypatch)
+    session = replace(context(runs), interaction="session")
+    original = a.store.reconciliation_release
+
+    def fail_after_release(*args):
+        original(*args)
+        raise ValueError("Injected database failure after reservation delete")
+
+    monkeypatch.setattr(a.store, "reconciliation_release", fail_after_release)
+    with pytest.raises(ValueError, match="Injected database failure"):
+        await a.reconcile(payload, session)
+    unchanged = await asyncio.to_thread(b.store.get, "alice", payload["run_id"])
+    assert unchanged["revision"] == payload["revision"] and not unchanged.get("resolutions")
+    assert await asyncio.to_thread(retained_slots, a, payload["run_id"]) == 1
+    monkeypatch.setattr(a.store, "reconciliation_release", original)
+    results = await asyncio.gather(a.reconcile(payload, session), b.reconcile({**payload, "decision_id": "competing", "outcome": "compensated"}, session), return_exceptions=True)
+    assert sum(isinstance(r, dict) for r in results) == 1
+    assert sum(isinstance(r, ValueError) for r in results) == 1
+    assert len((await asyncio.to_thread(b.store.get, "alice", payload["run_id"]))["resolutions"]) == 1
+    assert await asyncio.to_thread(retained_slots, b, payload["run_id"]) == 0
+    assert len(runs.starts) == 1  # Decisions never dispatch work implicitly.
+
+
+async def test_reconciliation_cannot_override_live_lease_or_unknown_capacity(cluster, monkeypatch):
+    from contextlib import closing
+
+    a, b, runs = cluster
+    payload = await lost_cluster_receipt(cluster, monkeypatch)
+    session = replace(context(runs), interaction="session")
+
+    def live(value):
+        with closing(a.store.connect()) as db, db:
+            db.execute("UPDATE extension_execution_leases SET expires_at=? WHERE resource_id=?", (value, payload["run_id"]))
+
+    await asyncio.to_thread(live, 10**12)
+    try:
+        with pytest.raises(ValueError, match="live Gateway"):
+            await b.reconcile(payload, session)
+        assert await asyncio.to_thread(retained_slots, b, payload["run_id"]) == 1
+    finally:
+        await asyncio.to_thread(live, 0)
+    unknown = await b.reconcile({**payload, "outcome": "unknown"}, session)
+    assert unknown["status"] == "needs_reconciliation"
+    assert await asyncio.to_thread(retained_slots, a, payload["run_id"]) == 1
+    with pytest.raises(ValueError):
+        await a.recover({"run_id": payload["run_id"]}, session)
+    with pytest.raises(ValueError):
+        await b.delete({"run_id": payload["run_id"]}, session)
+
+
+async def test_reconciliation_releases_cancelled_child_without_resurrecting_workflow(cluster, monkeypatch):
+    a, b, runs = cluster
+    payload = await lost_cluster_receipt(cluster, monkeypatch, cancel=True)
+    session = replace(context(runs), interaction="session")
+    with pytest.raises(ValueError, match="Cancellation cannot authorize"):
+        await b.reconcile({**payload, "outcome": "compensated"}, session)
+    assert (await b.reconcile(payload, session))["status"] == "cancelled"
+    assert await asyncio.to_thread(retained_slots, a, payload["run_id"]) == 0
+    with pytest.raises(ValueError, match="not recoverable"):
+        await a.recover({"run_id": payload["run_id"]}, session)
+    assert len(runs.starts) == 1
 
 
 async def test_expired_owner_cannot_write_after_takeover(cluster):

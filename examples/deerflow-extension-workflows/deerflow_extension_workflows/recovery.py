@@ -71,6 +71,7 @@ class Recovery:
             for artifact in record.get("artifacts", []):
                 await asyncio.to_thread(self.store.artifact, owner, run_id, artifact["version"])
             entry["replay"] = copy.deepcopy(record["journal"])
+            entry["reconciliation_replay"] = copy.deepcopy(record.get("reconciliation_replay", {}))
             record.update(status="queued", error=None)
             await self.save(owner, record)
             self.publish(entry)
@@ -143,6 +144,14 @@ class Recovery:
                 return expected["responses"]
             entry["recover_frame"] = True
         else:
+            # A resolved error invalidates its response and later frames, but
+            # not the durable identity/input of any already-started request.
+            # Match each such bridge request once before allowing row reuse.
+            requests = entry.get("reconciliation_replay", {})
+            for message in frame["messages"]:
+                old = requests.pop(str(message.get("id")), None)
+                if old == message:
+                    entry["recover_frame"] = True
             item = {"frame": copy.deepcopy(frame), "responses": None}
             size = len(json.dumps(item).encode())
             if record.get("journal_bytes", 0) + size > 4 * 1024 * 1024:

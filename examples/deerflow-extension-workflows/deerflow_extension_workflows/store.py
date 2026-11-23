@@ -3,6 +3,7 @@
 import hashlib
 import json
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
@@ -195,6 +196,43 @@ class Store:
         record["revision"] = revision + 1
         return revision + 1
 
+    def reconciliation_clock(self, db, owner, record):
+        return time.time()
+
+    def reconciliation_release(self, db, run_id, step_id):
+        # SQLite has no durable shared reservations; the service owns its file
+        # lock and rejects reconciliation until its local supervisor has drained.
+        return 0
+
+    def reconcile(self, owner, decision, observed, max_calls):
+        from .reconciliation import apply_decision, prior_decision
+
+        with closing(self.connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT data FROM workflows WHERE owner=? AND id=?", (owner, decision["run_id"])).fetchone()
+            if not row:
+                raise ValueError("Workflow unavailable")
+            record = json.loads(row[0])
+            old = prior_decision(record, decision)
+            if old is not None:
+                return old
+            # PostgreSQL locks the execution lease here, on its database clock.
+            # No host IO occurs in this transaction; the revision binds the
+            # observed child to precisely the unchanged durable attempt.
+            now = self.reconciliation_clock(db, owner, record)
+            receipt = apply_decision(record, decision, observed, actor=owner, now=now, max_calls=max_calls)
+            released = 0
+            if decision["outcome"] != "unknown":
+                released = self.reconciliation_release(db, record["id"], decision["step_id"])
+            record["resolutions"][-1]["reservations_released"] = released
+            record["revision"] = receipt["revision"]
+            raw = json.dumps(record, allow_nan=False)
+            if len(raw.encode()) > 8 * 1024 * 1024:
+                raise ValueError("Workflow recovery journal limit (8 MiB)")
+            if db.execute("UPDATE workflows SET status=?,data=?,revision=revision+1 WHERE owner=? AND id=? AND revision=?", (record["status"], raw, owner, record["id"], decision["revision"])).rowcount != 1:
+                raise ValueError("Stale workflow revision")
+            return receipt
+
     def get(self, owner, run_id):
         with closing(self.connect()) as db:
             row = db.execute("SELECT data FROM workflows WHERE owner=? AND id=?", (owner, run_id)).fetchone()
@@ -226,9 +264,12 @@ class Store:
 
     def delete(self, owner, run_id):
         with closing(self.connect()) as db, db:
-            row = db.execute("SELECT status FROM workflows WHERE owner=? AND id=?", (owner, run_id)).fetchone()
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,data FROM workflows WHERE owner=? AND id=?", (owner, run_id)).fetchone()
             if not row or row[0] not in TERMINAL:
                 raise ValueError("Only finished workflow records can be deleted")
+            if row[0] == "needs_reconciliation" or (row[0] == "recoverable" and any(s["status"] not in ("completed", "queued", "cancelled") for s in json.loads(row[1])["steps"])):
+                raise ValueError("Reconcile uncertain child outcomes before deleting")
             db.execute(
                 "DELETE FROM workflow_artifacts WHERE owner=? AND workflow=?",
                 (owner, run_id),
