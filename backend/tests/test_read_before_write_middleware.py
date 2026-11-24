@@ -45,6 +45,47 @@ def _middleware(files: dict[str, str]):
     return ReadBeforeWriteMiddleware(content_reader=reader)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("operation", ["write", "append", "replace"])
+@pytest.mark.parametrize("path", ["/mnt/skills/public/example/SKILL.md", "/mnt/acp-workspace/source.py"])
+async def test_readonly_mutations_skip_gate_inspection_and_sandbox_acquire(monkeypatch, operation, path, asynchronous):
+    from unittest.mock import AsyncMock
+
+    from deerflow.agents.middlewares.read_before_write_middleware import ReadBeforeWriteMiddleware
+    from deerflow.sandbox import tools as sandbox_tools
+
+    sandbox = MagicMock()
+    sandbox.read_file.return_value = "before"
+    initialize = MagicMock(return_value=sandbox)
+    initialize_async = AsyncMock(return_value=sandbox)
+    monkeypatch.setattr(sandbox_tools, "ensure_sandbox_initialized", initialize)
+    monkeypatch.setattr(sandbox_tools, "ensure_sandbox_initialized_async", initialize_async)
+    monkeypatch.setattr(sandbox_tools, "_get_skills_container_path", lambda: "/mnt/skills")
+    tool = sandbox_tools.str_replace_tool if operation == "replace" else sandbox_tools.write_file_tool
+    args = {"path": path}
+    args.update({"old_str": "before", "new_str": "after"} if operation == "replace" else {"content": "after", "append": operation == "append"})
+    request = _make_request(tool.name, args)
+    request.runtime.state = {}
+    request.runtime.config = {}
+    middleware = ReadBeforeWriteMiddleware()
+
+    def handler(req):
+        return ToolMessage(content=tool.func(runtime=req.runtime, **req.tool_call["args"]), tool_call_id="call-1", name=tool.name)
+
+    async def async_handler(req):
+        content = await tool.coroutine(runtime=req.runtime, **req.tool_call["args"])
+        return ToolMessage(content=content, tool_call_id="call-1", name=tool.name)
+
+    result = await middleware.awrap_tool_call(request, async_handler) if asynchronous else middleware.wrap_tool_call(request, handler)
+
+    assert result.content.startswith("Error:")
+    initialize.assert_not_called()
+    initialize_async.assert_not_called()
+    sandbox.read_file.assert_not_called()
+    sandbox.write_file.assert_not_called()
+
+
 class TestReadCurrentFileContent:
     def test_reads_via_sandbox_with_resolution(self):
         from deerflow.sandbox import tools as sandbox_tools

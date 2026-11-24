@@ -56,6 +56,7 @@ from deerflow.config.read_before_write_config import ReadBeforeWriteConfig
 from deerflow.sandbox.exceptions import SandboxAuthorizationError
 from deerflow.sandbox.read_file_contract import READ_FILE_EMPTY, READ_FILE_NO_CONTENT_RESULTS, count_file_lines
 from deerflow.sandbox.tools import (
+    _readonly_file_tool_error,
     read_current_file_content,
     sandbox_authorization_scope,
     sandbox_authorization_scope_async,
@@ -346,6 +347,10 @@ class ReadBeforeWriteMiddleware(AgentMiddleware):
         tool_call = request.tool_call
         path = self._requested_path(request)
         if path is None:
+            return None
+        # Let the tool reject read-only mutations before this gate inspects a
+        # file: the production content reader would otherwise acquire a sandbox.
+        if _readonly_file_tool_error(path) is not None:
             return None
         try:
             current = self._content_reader(request.runtime, path)

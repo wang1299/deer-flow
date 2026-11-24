@@ -14,6 +14,10 @@ skills container path or `/mnt/acp-workspace` before acquiring a sandbox. Compar
 normalized absolute POSIX virtual paths with complete path-component boundaries.
 Keep provider path mapping unchanged. Run config-dependent validation off the
 event loop in async entry points, before the common async acquisition wrapper.
+The default read-before-write middleware skips content inspection for these
+mutations and delegates to the tool's denial, so its version gate does not
+acquire a sandbox first. Authorization and normal tool result handling remain
+in place.
 
 ## Consequences
 
