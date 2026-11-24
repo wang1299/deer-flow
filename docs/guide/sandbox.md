@@ -1,5 +1,13 @@
 # Sandbox
 
+The `write_file` tool (including append) and `str_replace` reject writes to the
+configured skills container path (default `/mnt/skills`) and `/mnt/acp-workspace`
+for every sandbox provider, before acquiring a sandbox. This includes normalized
+absolute virtual paths such as `/mnt/user-data/../skills/example/SKILL.md`.
+Use the skill management flow to change skills. Writable user-data paths keep
+their existing behavior. This tool check does not replace provider filesystem
+enforcement for Bash, symlinks or other aliases.
+
 ## Sandbox Mode
 
 DeerFlow supports multiple sandbox execution modes:

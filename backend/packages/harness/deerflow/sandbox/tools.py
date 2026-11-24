@@ -429,6 +429,18 @@ def _is_acp_workspace_path(path: str) -> bool:
     return path == _ACP_WORKSPACE_VIRTUAL_PATH or path.startswith(f"{_ACP_WORKSPACE_VIRTUAL_PATH}/")
 
 
+def _readonly_file_tool_error(path: str) -> str | None:
+    """Apply built-in read-only policy without resolving provider or host paths."""
+    if not path.startswith("/"):
+        return None
+    normalized = posixpath.normpath("/" + path.lstrip("/"))
+    for root, label in ((_get_skills_container_path(), "skills"), (_ACP_WORKSPACE_VIRTUAL_PATH, "ACP workspace")):
+        root = posixpath.normpath("/" + root.lstrip("/"))
+        if normalized == root or normalized.startswith(root.rstrip("/") + "/"):
+            return f"Error: Write access to read-only {label} path is not allowed: {path}"
+    return None
+
+
 def _get_custom_mounts():
     """Get custom volume mounts from sandbox config.
 
@@ -3505,6 +3517,9 @@ def write_file_tool(
                 )
     try:
         requested_path = path
+        readonly_error = _readonly_file_tool_error(path)
+        if readonly_error is not None:
+            return readonly_error
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
         if is_local_sandbox(runtime):
@@ -3544,6 +3559,9 @@ async def _write_file_tool_async(
     placeholder_error = _reject_elision_placeholder_content(content)
     if placeholder_error is not None:
         return placeholder_error
+    readonly_error = await run_sync_lifecycle_operation(_readonly_file_tool_error, path)
+    if readonly_error is not None:
+        return readonly_error
     return await _run_sync_tool_after_async_sandbox_init(write_file_tool.func, runtime, path, content, description, append)
 
 
@@ -3594,6 +3612,9 @@ def str_replace_tool(
         replace_all: Whether to replace all occurrences of the substring. If False, only the first occurrence will be replaced. Default is False.
     """
     try:
+        readonly_error = _readonly_file_tool_error(path)
+        if readonly_error is not None:
+            return readonly_error
         sandbox = ensure_sandbox_initialized(runtime)
         ensure_thread_directories_exist(runtime)
         requested_path = path
@@ -3636,6 +3657,9 @@ async def _str_replace_tool_async(
     description: str = "",
     replace_all: bool = False,
 ) -> str:
+    readonly_error = await run_sync_lifecycle_operation(_readonly_file_tool_error, path)
+    if readonly_error is not None:
+        return readonly_error
     return await _run_sync_tool_after_async_sandbox_init(
         str_replace_tool.func,
         runtime,

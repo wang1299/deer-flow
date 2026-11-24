@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from deerflow.sandbox import tools as sandbox_tools
 from deerflow.sandbox.exceptions import SandboxError
 from deerflow.sandbox.local.local_sandbox import LocalSandbox
 from deerflow.sandbox.tools import (
@@ -2227,3 +2228,93 @@ def test_file_operation_lock_memory_cleanup() -> None:
 
     # 检查特定 key 是否被清理（而不是检查总长度）
     assert lock_key not in _FILE_OPERATION_LOCKS
+
+
+@pytest.fixture
+def file_mutation_probe(monkeypatch):
+    events = []
+
+    class RemoteSandbox:
+        id = "readonly-file-tool-probe"
+
+        def __init__(self):
+            self.writes = []
+
+        def read_file(self, path):
+            return "before"
+
+        def write_file(self, path, content, append=False):
+            self.writes.append((path, content, append))
+
+    sandbox = RemoteSandbox()
+
+    def initialize(runtime):
+        events.append("sync-init")
+        return sandbox
+
+    async def initialize_async(runtime):
+        events.append("async-init")
+        return sandbox
+
+    monkeypatch.setattr(sandbox_tools, "ensure_sandbox_initialized", initialize)
+    monkeypatch.setattr(sandbox_tools, "ensure_sandbox_initialized_async", initialize_async)
+    monkeypatch.setattr(sandbox_tools, "ensure_thread_directories_exist", lambda runtime: None)
+    monkeypatch.setattr(sandbox_tools, "is_local_sandbox", lambda runtime: False)
+    monkeypatch.setattr(sandbox_tools, "_get_skills_container_path", lambda: "/mnt/skills")
+    runtime = SimpleNamespace(state={}, context={"thread_id": "readonly-file-tool", "user_id": "synthetic-user"}, config={})
+    return SimpleNamespace(sandbox=sandbox, runtime=runtime, events=events)
+
+
+async def _invoke_file_mutation(probe, operation, path, asynchronous):
+    tool = str_replace_tool if operation == "replace" else write_file_tool
+    kwargs = {"runtime": probe.runtime, "path": path}
+    kwargs.update({"old_str": "before", "new_str": "after"} if operation == "replace" else {"content": "after", "append": operation == "append"})
+    return await tool.coroutine(**kwargs) if asynchronous else tool.func(**kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("operation", ["write", "append", "replace"])
+@pytest.mark.parametrize("path", ["/mnt/skills/public/example/SKILL.md", "/mnt/acp-workspace/source.py"])
+async def test_remote_file_mutations_reject_readonly_mounts_before_acquire(file_mutation_probe, operation, path, asynchronous):
+    result = await _invoke_file_mutation(file_mutation_probe, operation, path, asynchronous)
+    assert result.startswith("Error:")
+    assert file_mutation_probe.sandbox.writes == []
+    assert file_mutation_probe.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/mnt/skills", "/mnt/acp-workspace", "/mnt/user-data/../skills/public/example/SKILL.md", "//mnt//skills/./public/example/SKILL.md"])
+async def test_remote_write_rejects_readonly_roots_and_normalized_aliases(file_mutation_probe, path):
+    result = await _invoke_file_mutation(file_mutation_probe, "write", path, False)
+    assert result.startswith("Error:")
+    assert file_mutation_probe.sandbox.writes == []
+    assert file_mutation_probe.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("operation", ["write", "replace"])
+async def test_remote_file_mutations_respect_configured_skills_root(file_mutation_probe, monkeypatch, operation, asynchronous):
+    monkeypatch.setattr(sandbox_tools, "_get_skills_container_path", lambda: "/opt/agent-skills")
+    result = await _invoke_file_mutation(file_mutation_probe, operation, "/opt/agent-skills/example/SKILL.md", asynchronous)
+    assert result.startswith("Error:")
+    assert file_mutation_probe.sandbox.writes == []
+    assert file_mutation_probe.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("operation", ["write", "append", "replace"])
+async def test_remote_output_file_mutations_keep_existing_behavior(file_mutation_probe, operation, asynchronous):
+    path = "/mnt/user-data/outputs/report.txt"
+    assert await _invoke_file_mutation(file_mutation_probe, operation, path, asynchronous) == "OK"
+    assert file_mutation_probe.sandbox.writes == [(path, "after", operation == "append")]
+    assert file_mutation_probe.events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/mnt/skills-copy/report.txt", "/mnt/acp-workspace-copy/report.txt"])
+async def test_remote_write_does_not_block_sibling_path_prefixes(file_mutation_probe, path):
+    assert await _invoke_file_mutation(file_mutation_probe, "write", path, False) == "OK"
+    assert file_mutation_probe.sandbox.writes == [(path, "after", False)]
